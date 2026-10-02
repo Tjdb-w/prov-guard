@@ -1,0 +1,16 @@
+{
+  "name": "prov-guard",
+  "version": "1.0.0",
+  "description": "软件供应链证明与完整性校验工具：构建产物签名、证明生成/验证、篡改检测与 SBOM 输出",
+  "type": "module",
+  "bin": {
+    "provguard": "./provguard.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

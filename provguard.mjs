@@ -1,0 +1,746 @@
+#!/usr/bin/env node
+// Prov Guard —— 软件供应链证明与完整性校验工具（零依赖，Node >= 18）。
+//
+// 子命令：
+//   keygen   --key-dir <dir> [--name <prefix>]
+//   generate --artifact <path> --key <private-key> --out <dir>
+//   verify   --artifact <path> --proof <file> --signature <file> --key <public-key>
+//
+// 所有输出均为 UTF-8；成功结果写 stdout，错误结果写 stderr。
+
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  sign as cryptoSign,
+  verify as cryptoVerify,
+} from 'node:crypto';
+import { constants as fsConstants, readFileSync, realpathSync } from 'node:fs';
+import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+export const PROOF_VERSION = '1.0';
+
+// ---------------------------------------------------------------------------
+// 错误类型：携带机器可读错误码，CLI 边界统一转换为非零退出。
+// ---------------------------------------------------------------------------
+
+export const ERROR_CODES = Object.freeze({
+  INPUT_NOT_FOUND: 'INPUT_NOT_FOUND',
+  PERMISSION_DENIED: 'PERMISSION_DENIED',
+  PROOF_INVALID: 'PROOF_INVALID',
+  SIGNATURE_INVALID: 'SIGNATURE_INVALID',
+  KEY_NOT_FOUND: 'KEY_NOT_FOUND',
+  INTEGRITY_MISMATCH: 'INTEGRITY_MISMATCH',
+  USAGE_ERROR: 'USAGE_ERROR',
+});
+
+class ProvError extends Error {
+  constructor(code, message, details) {
+    super(message);
+    this.name = 'ProvError';
+    this.code = code;
+    if (details !== undefined) this.details = details;
+  }
+}
+
+// 把 Node 底层错误归类为 INPUT_NOT_FOUND / PERMISSION_DENIED，其余原样抛出。
+function wrapFsError(err, context) {
+  if (err instanceof ProvError) return err;
+  const where = context ? `${context}: ` : '';
+  if (err && err.code === 'ENOENT') {
+    return new ProvError(ERROR_CODES.INPUT_NOT_FOUND, `${where}路径不存在 (${err.path || 'unknown path'})`);
+  }
+  if (err && (err.code === 'EACCES' || err.code === 'EPERM')) {
+    return new ProvError(ERROR_CODES.PERMISSION_DENIED, `${where}权限不足 (${err.path || 'unknown path'})`);
+  }
+  return err;
+}
+
+// ---------------------------------------------------------------------------
+// 路径与摘要工具
+// ---------------------------------------------------------------------------
+
+// 清单中的相对路径统一使用正斜杠，保证跨平台稳定。
+export function toPosix(relPath) {
+  return relPath.split(sep).join('/');
+}
+
+// 稳定哈希：SHA-256，摘要对象按 key 排序后以 UTF-8 序列化（两空格缩进）。
+export function stableJsonStringify(value) {
+  return JSON.stringify(sortDeep(value), null, 2);
+}
+
+function sortDeep(value) {
+  if (Array.isArray(value)) return value.map(sortDeep);
+  if (value !== null && typeof value === 'object') {
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = sortDeep(value[key]);
+    return out;
+  }
+  return value;
+}
+
+export function sha256Hex(data) {
+  return createHash('sha256').update(data).digest('hex');
+}
+
+// 公钥指纹：对 SPKI 编码的 DER 字节取 SHA-256。写入证明并随证明一起签名，
+// 验证时据此区分“使用了错误公钥”（指纹不一致）与“签名内容被篡改”（指纹一致但验签失败）。
+export function keyFingerprint(keyObj) {
+  return sha256Hex(keyObj.export({ type: 'spki', format: 'der' }));
+}
+
+// ---------------------------------------------------------------------------
+// 产物扫描：递归列出全部常规文件（含符号链接解引用后的目标），
+// 空目录自然产生空清单；零字节文件按真实文件记录。
+// ---------------------------------------------------------------------------
+
+async function walkFiles(rootDir) {
+  const found = [];
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      throw wrapFsError(err, '读取产物目录');
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()) {
+        found.push(full);
+      } else if (entry.isSymbolicLink()) {
+        // 解引用后按目标类型处理：指向目录则继续递归，指向文件则记录。
+        let target;
+        try {
+          target = await stat(full);
+        } catch (err) {
+          throw wrapFsError(err, '读取符号链接');
+        }
+        if (target.isDirectory()) await walk(full);
+        else if (target.isFile()) found.push(full);
+      }
+      // 其他特殊文件（套接字/设备等）忽略。
+    }
+  }
+  await walk(rootDir);
+  return found;
+}
+
+// 判断 root 是否位于 outDir 之内（用于从扫描结果排除输出目录自身）。
+function isWithin(pathAbs, dirAbs) {
+  const relPath = relative(dirAbs, pathAbs);
+  return relPath === '' || (!!relPath && !relPath.startsWith('..') && !isAbsolute(relPath));
+}
+
+async function fileTypeFromPath(fullPath, data) {
+  // 极简魔数嗅探，仅用于清单的 type 字段；不识别时回退为扩展名或 "data"。
+  // 一律使用字节数组，避免多字节字符串经 UTF-8 编码后长度/取值不符。
+  const startsWith = (bytes) =>
+    data.length >= bytes.length && bytes.every((b, i) => data[i] === b);
+  if (startsWith([0x1f, 0x8b])) return 'application/gzip';
+  if (startsWith([0x50, 0x4b, 0x03, 0x04])) return 'application/zip';
+  if (startsWith([0x25, 0x50, 0x44, 0x46, 0x2d])) return 'application/pdf'; // %PDF-
+  if (startsWith([0x7f, 0x45, 0x4c, 0x46])) return 'application/x-elf';
+  if (startsWith([0x4d, 0x5a])) return 'application/x-dosexec'; // MZ
+  if (startsWith([0xff, 0xd8, 0xff])) return 'image/jpeg';
+  if (startsWith([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return 'image/png';
+  // 类脚本/文本：UTF BOM，或前 512 字节不含 NUL 则视为 text。
+  if (
+    startsWith([0xef, 0xbb, 0xbf]) ||
+    startsWith([0xff, 0xfe]) ||
+    startsWith([0xfe, 0xff])
+  ) {
+    return 'text/plain';
+  }
+  if (!data.subarray(0, 512).includes(0)) return 'text/plain';
+  const ext = basename(fullPath).split('.').pop();
+  return ext && ext !== basename(fullPath) ? `application/x-${ext.toLowerCase()}` : 'application/octet-stream';
+}
+
+// 构建 SBOM。时间字段不进入清单，文件摘要只依赖文件字节与相对路径。
+// excludeDir 为输出目录的绝对路径（若位于产物内部则排除）。
+export async function buildSbom(artifactPath, excludeDir) {
+  const artifactAbs = resolve(artifactPath);
+  let artifactStat;
+  try {
+    artifactStat = await stat(artifactAbs);
+  } catch (err) {
+    throw wrapFsError(err, '读取产物');
+  }
+
+  const rootDir = artifactStat.isDirectory() ? artifactAbs : dirname(artifactAbs);
+  const excludeAbs = excludeDir ? resolve(excludeDir) : null;
+
+  let files;
+  if (artifactStat.isDirectory()) {
+    files = await walkFiles(artifactAbs);
+  } else {
+    files = [artifactAbs];
+  }
+
+  const entries = [];
+  for (const full of files) {
+    if (excludeAbs && isWithin(full, excludeAbs)) continue;
+    let data;
+    try {
+      data = await readFile(full);
+    } catch (err) {
+      throw wrapFsError(err, '读取产物文件');
+    }
+    const relPath = toPosix(relative(rootDir, full));
+    entries.push({
+      path: relPath,
+      sha256: sha256Hex(data),
+      size: data.length,
+      type: await fileTypeFromPath(full, data),
+    });
+  }
+
+  // 按相对路径排序，保证同一输入产生字节级一致的清单。
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+  return {
+    schemaVersion: '1.0',
+    artifactName: artifactStat.isDirectory() ? basename(artifactAbs) : basename(artifactAbs),
+    rootType: artifactStat.isDirectory() ? 'directory' : 'file',
+    files: entries,
+  };
+}
+
+// 顶层产物摘要：对“排序后的文件条目列表”做稳定哈希。
+// 任何字节变化、文件新增/删除/重命名都会改变该摘要。
+export function computeArtifactDigest(sbom) {
+  return sha256Hex(stableJsonStringify(sbom.files));
+}
+
+// ---------------------------------------------------------------------------
+// 密钥与签名（Ed25519，PEM）
+// ---------------------------------------------------------------------------
+
+function readPrivateKey(keyPath) {
+  let pem;
+  try {
+    pem = readFileSync(keyPath);
+  } catch (err) {
+    throw wrapFsError(err, '读取私钥');
+  }
+  let keyObj;
+  try {
+    keyObj = createPrivateKey({ key: pem, format: 'pem' });
+  } catch {
+    throw new ProvError(ERROR_CODES.KEY_NOT_FOUND, `私钥无法解析或格式不受支持: ${keyPath}`);
+  }
+  if (keyObj.asymmetricKeyType !== 'ed25519') {
+    throw new ProvError(
+      ERROR_CODES.KEY_NOT_FOUND,
+      `私钥类型不是 Ed25519（实际为 ${keyObj.asymmetricKeyType}）: ${keyPath}`,
+    );
+  }
+  return keyObj;
+}
+
+function readPublicKey(keyPath) {
+  let pem;
+  try {
+    pem = readFileSync(keyPath);
+  } catch (err) {
+    throw wrapFsError(err, '读取公钥');
+  }
+  let keyObj;
+  try {
+    keyObj = createPublicKey({ key: pem, format: 'pem' });
+  } catch {
+    throw new ProvError(ERROR_CODES.KEY_NOT_FOUND, `公钥无法解析或格式不受支持: ${keyPath}`);
+  }
+  if (keyObj.asymmetricKeyType !== 'ed25519') {
+    throw new ProvError(
+      ERROR_CODES.KEY_NOT_FOUND,
+      `公钥类型不是 Ed25519（实际为 ${keyObj.asymmetricKeyType}）: ${keyPath}`,
+    );
+  }
+  return keyObj;
+}
+
+// 生成阶段时间戳采用 UTC ISO-8601；它只写入 proof，不参与任何摘要。
+function nowIso() {
+  return new Date().toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// keygen
+// ---------------------------------------------------------------------------
+
+export async function keygen({ keyDir, name = 'provguard' }) {
+  const absDir = resolve(keyDir);
+  try {
+    await mkdir(absDir, { recursive: true });
+  } catch (err) {
+    throw wrapFsError(err, '创建密钥目录');
+  }
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const privPath = join(absDir, `${name}.private.pem`);
+  const pubPath = join(absDir, `${name}.public.pem`);
+  try {
+    await writeFile(
+      privPath,
+      privateKey.export({ type: 'pkcs8', format: 'pem' }),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      pubPath,
+      publicKey.export({ type: 'spki', format: 'pem' }),
+      { mode: 0o644 },
+    );
+  } catch (err) {
+    throw wrapFsError(err, '写入密钥');
+  }
+  return { privateKeyPath: privPath, publicKeyPath: pubPath };
+}
+
+// ---------------------------------------------------------------------------
+// generate
+// ---------------------------------------------------------------------------
+
+export async function generate({ artifact, key, out }) {
+  // 输入检查：产物与私钥必须存在且可读。
+  const artifactAbs = resolve(artifact);
+  const keyAbs = resolve(key);
+  for (const [p, label] of [
+    [artifactAbs, '产物'],
+    [keyAbs, '私钥'],
+  ]) {
+    try {
+      await access(p, fsConstants.R_OK);
+    } catch (err) {
+      throw wrapFsError(err, `读取${label}`);
+    }
+  }
+
+  const outAbs = resolve(out);
+  const parent = dirname(outAbs);
+  try {
+    await mkdir(parent, { recursive: true });
+  } catch (err) {
+    throw wrapFsError(err, '创建输出目录');
+  }
+
+  // 若输出目录尚不存在，先按真实路径创建，再据此排除。
+  try {
+    await mkdir(outAbs, { recursive: true });
+  } catch (err) {
+    throw wrapFsError(err, '创建输出目录');
+  }
+  let outReal;
+  try {
+    outReal = await realpath(outAbs);
+  } catch (err) {
+    throw wrapFsError(err, '解析输出目录');
+  }
+
+  const privateKey = readPrivateKey(keyAbs);
+  // 由私钥导出对应公钥，记录其指纹到证明中，供验证区分错误公钥与签名失配。
+  const signingPublicKey = createPublicKey(privateKey);
+  const signerKeyFingerprint = keyFingerprint(signingPublicKey);
+
+  const sbom = await buildSbom(artifactAbs, outReal);
+  const artifactDigest = computeArtifactDigest(sbom);
+
+  const proof = {
+    proofVersion: PROOF_VERSION,
+    artifactName: basename(artifactAbs),
+    artifactDigest,
+    fileName: basename(artifactAbs),
+    size: sbom.files.reduce((n, f) => n + f.size, 0),
+    generatedAt: nowIso(),
+    signerKeyFingerprint,
+    files: sbom.files,
+  };
+  // 稳定字段顺序：proof 先按既定顺序构造，再整体排序输出。
+  const proofJson = stableJsonStringify(proof) + '\n';
+  const sbomJson = stableJsonStringify(sbom) + '\n';
+
+  // 对证明的规范字节（不含尾部换行）签名，验证时使用同一规范形式。
+  // Ed25519 为纯签名算法，不接受摘要算法参数，故用 sign(null, data, key)。
+  const signature = cryptoSign(null, Buffer.from(proofJson.trimEnd(), 'utf8'), privateKey);
+  const signatureB64 = signature.toString('base64') + '\n';
+
+  const proofPath = join(outReal, 'proof.json');
+  const sbomPath = join(outReal, 'sbom.json');
+  const sigPath = join(outReal, 'proof.json.sig');
+  try {
+    await atomicWrite(proofPath, proofJson);
+    await atomicWrite(sbomPath, sbomJson);
+    await atomicWrite(sigPath, signatureB64);
+  } catch (err) {
+    throw wrapFsError(err, '写入证明产物');
+  }
+
+  return {
+    proofPath,
+    sbomPath,
+    signaturePath: sigPath,
+    artifactDigest,
+    fileCount: sbom.files.length,
+    proofVersion: PROOF_VERSION,
+  };
+}
+
+// 同目录临时文件 + rename，避免半成品证明文件留在输出目录。
+async function atomicWrite(target, contents) {
+  const dir = dirname(target);
+  const tmp = join(dir, `.${basename(target)}.${process.pid}.tmp`);
+  await writeFile(tmp, contents, { mode: 0o644 });
+  try {
+    await rename(tmp, target);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// verify
+// ---------------------------------------------------------------------------
+
+export async function verify({ artifact, proof: proofPath, signature: sigPath, key: pubKeyPath }) {
+  const artifactAbs = resolve(artifact);
+  const proofAbs = resolve(proofPath);
+  const sigAbs = resolve(sigPath);
+  const keyAbs = resolve(pubKeyPath);
+
+  // 1) 所有输入必须存在且可读。
+  for (const [p, label] of [
+    [artifactAbs, '产物'],
+    [proofAbs, '证明文件'],
+    [sigAbs, '签名文件'],
+    [keyAbs, '公钥'],
+  ]) {
+    try {
+      await access(p, fsConstants.R_OK);
+    } catch (err) {
+      throw wrapFsError(err, `读取${label}`);
+    }
+  }
+
+  // 2) 公钥必须可解析且为 Ed25519 —— 错误/不支持的公钥归 KEY_NOT_FOUND。
+  const publicKey = readPublicKey(keyAbs);
+
+  // 3) 证明文件必须是可解析的 JSON 且结构合法 —— 否则 PROOF_INVALID。
+  let proofText;
+  try {
+    proofText = await readFileUtf8(proofAbs);
+  } catch (err) {
+    throw wrapFsError(err, '读取证明文件');
+  }
+  let proof;
+  try {
+    proof = JSON.parse(proofText);
+  } catch {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '证明文件不是合法的 JSON');
+  }
+  const proofError = validateProof(proof);
+  if (proofError) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, proofError);
+  }
+
+  // 4) 签名文件必须是合法 Base64 且长度符合 Ed25519（64 字节）—— 否则 PROOF_INVALID。
+  const sigText = await readFileUtf8(sigAbs);
+  const sigB64 = sigText.replace(/\s+/g, '');
+  let sigBuf;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '签名文件不是合法的 Base64 内容');
+  }
+  try {
+    sigBuf = Buffer.from(sigB64, 'base64');
+  } catch {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '签名文件无法解码为字节');
+  }
+  if (sigBuf.length !== 64) {
+    throw new ProvError(
+      ERROR_CODES.PROOF_INVALID,
+      `签名长度非法（Ed25519 应为 64 字节，实际 ${sigBuf.length} 字节）`,
+    );
+  }
+
+  // 5) 重算证明的规范字节并验签。
+  //    以磁盘上的 proof.json 原样为真，重新序列化其解析结果用于验签；
+  //    generate 写出的即为稳定规范形式，因此往返一致。
+  //
+  //    错误归类（三者互不相同）：
+  //      - 提供的公钥与证明中记录的签钥指纹不一致  -> KEY_NOT_FOUND（错误公钥）
+  //      - 公钥一致但签名验证失败                  -> SIGNATURE_INVALID（签名内容不匹配）
+  //      - 签名文件本身格式非法（前面）            -> PROOF_INVALID
+  const providedFingerprint = keyFingerprint(publicKey);
+  if (providedFingerprint.toLowerCase() !== proof.signerKeyFingerprint.toLowerCase()) {
+    throw new ProvError(
+      ERROR_CODES.KEY_NOT_FOUND,
+      '提供的公钥与证明记录的签名密钥不一致（可能使用了错误公钥）',
+      {
+        providedKeyFingerprint: providedFingerprint,
+        proofKeyFingerprint: proof.signerKeyFingerprint,
+      },
+    );
+  }
+
+  const canonicalProof = stableJsonStringify(proof);
+  let sigOk = false;
+  try {
+    sigOk = cryptoVerify(null, Buffer.from(canonicalProof, 'utf8'), publicKey, sigBuf);
+  } catch {
+    sigOk = false;
+  }
+  if (!sigOk) {
+    throw new ProvError(
+      ERROR_CODES.SIGNATURE_INVALID,
+      '签名与证明内容不匹配（证明可能被改动，或签名已损坏）',
+    );
+  }
+
+  // 6) 签名通过后重新扫描产物并逐项比对 —— 任何差异均为 INTEGRITY_MISMATCH。
+  //    排除输出目录：证明/签名/清单通常与产物相邻，验证时不得把它们计入产物。
+  const excludeDir = inferExcludeDir(proofAbs, artifactAbs);
+  const currentSbom = await buildSbom(artifactAbs, excludeDir);
+  const currentDigest = computeArtifactDigest(currentSbom);
+
+  const mismatches = diffManifest(proof, currentSbom, currentDigest);
+  if (mismatches.length > 0) {
+    throw new ProvError(
+      ERROR_CODES.INTEGRITY_MISMATCH,
+      `检测到 ${mismatches.length} 处完整性差异`,
+      { mismatches },
+    );
+  }
+
+  return {
+    status: 'VERIFIED',
+    proofVersion: proof.proofVersion,
+    artifactDigest: currentDigest,
+    fileCount: currentSbom.files.length,
+  };
+}
+
+function inferExcludeDir(proofAbs, artifactAbs) {
+  // 证明文件所在目录若位于产物之内，则将其视为生成时的输出目录予以排除。
+  const proofDir = dirname(proofAbs);
+  if (isWithin(proofDir, artifactAbs)) return proofDir;
+  return null;
+}
+
+async function readFileUtf8(p) {
+  try {
+    return (await readFile(p, 'utf8'));
+  } catch (err) {
+    throw wrapFsError(err, '读取文件');
+  }
+}
+
+function validateProof(proof) {
+  if (proof === null || typeof proof !== 'object' || Array.isArray(proof)) {
+    return '证明文件顶层必须是 JSON 对象';
+  }
+  const needString = ['proofVersion', 'artifactName', 'artifactDigest', 'fileName', 'generatedAt', 'signerKeyFingerprint'];
+  for (const k of needString) {
+    if (typeof proof[k] !== 'string' || proof[k].length === 0) {
+      return `证明字段缺失或类型非法: ${k}`;
+    }
+  }
+  if (!/^[0-9a-f]{64}$/i.test(proof.artifactDigest)) {
+    return '证明中的 artifactDigest 不是合法的 SHA-256 十六进制摘要';
+  }
+  if (!/^[0-9a-f]{64}$/i.test(proof.signerKeyFingerprint)) {
+    return '证明中的 signerKeyFingerprint 不是合法的 SHA-256 十六进制摘要';
+  }
+  if (typeof proof.size !== 'number' || !Number.isFinite(proof.size) || proof.size < 0) {
+    return '证明字段缺失或类型非法: size';
+  }
+  if (!Array.isArray(proof.files)) return '证明字段缺失或类型非法: files';
+  const seen = new Set();
+  for (const f of proof.files) {
+    if (f === null || typeof f !== 'object') return '清单条目必须是对象';
+    if (typeof f.path !== 'string' || f.path.length === 0) return '清单条目 path 非法';
+    if (f.path.includes('\\')) return `清单相对路径必须使用正斜杠: ${f.path}`;
+    if (f.path.startsWith('/') || f.path.split('/').includes('..')) {
+      return `清单相对路径越界: ${f.path}`;
+    }
+    if (seen.has(f.path)) return `清单路径重复: ${f.path}`;
+    seen.add(f.path);
+    if (!/^[0-9a-f]{64}$/i.test(f.sha256)) return `清单条目摘要非法: ${f.path}`;
+    if (typeof f.size !== 'number' || !Number.isFinite(f.size) || f.size < 0) {
+      return `清单条目大小非法: ${f.path}`;
+    }
+    if (typeof f.type !== 'string' || f.type.length === 0) return `清单条目类型非法: ${f.path}`;
+  }
+  return null;
+}
+
+// 返回差异列表；每条 {path, kind}。顶层摘要差异兜底。
+function diffManifest(proof, currentSbom, currentDigest) {
+  const mismatches = [];
+  const proofFiles = new Map(proof.files.map((f) => [f.path, f]));
+  const currentFiles = new Map(currentSbom.files.map((f) => [f.path, f]));
+
+  for (const [path, pf] of proofFiles) {
+    const cur = currentFiles.get(path);
+    if (!cur) {
+      mismatches.push({ path, kind: 'missing' }); // 证明中存在、产物中已删除
+      continue;
+    }
+    if (cur.sha256.toLowerCase() !== pf.sha256.toLowerCase()) {
+      mismatches.push({ path, kind: 'content-modified' });
+    } else if (cur.size !== pf.size) {
+      mismatches.push({ path, kind: 'size-mismatch' });
+    }
+  }
+  for (const path of currentFiles.keys()) {
+    if (!proofFiles.has(path)) {
+      mismatches.push({ path, kind: 'added' }); // 产物中新出现的文件
+    }
+  }
+
+  if (proof.artifactDigest.toLowerCase() !== currentDigest.toLowerCase() && mismatches.length === 0) {
+    // 理论上不会发生（逐文件比对已覆盖），作为顶层摘要兜底。
+    mismatches.push({ path: '.', kind: 'artifact-digest-mismatch' });
+  }
+  if (proof.fileName !== currentSbom.artifactName) {
+    mismatches.push({ path: '.', kind: 'artifact-name-mismatch' });
+  }
+
+  mismatches.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.kind < b.kind ? -1 : 1));
+  return mismatches;
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+function parseArgs(argv) {
+  const args = { _: [] };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('--')) {
+        args[key] = true;
+      } else {
+        args[key] = next;
+        i += 1;
+      }
+    } else {
+      args._.push(a);
+    }
+  }
+  return args;
+}
+
+function usage() {
+  return [
+    'Prov Guard —— 软件供应链证明与完整性校验工具',
+    '',
+    '用法:',
+    '  provguard keygen   --key-dir <dir> [--name <prefix>]',
+    '  provguard generate --artifact <path> --key <private.pem> --out <dir>',
+    '  provguard verify   --artifact <path> --proof <proof.json> \\',
+    '                      --signature <proof.json.sig> --key <public.pem>',
+    '',
+    'generate 输出: proof.json / proof.json.sig / sbom.json',
+    '成功状态: VERIFIED；错误码见 README。',
+  ].join('\n');
+}
+
+function printMachineError(err) {
+  const payload = {
+    status: 'ERROR',
+    errorCode: err instanceof ProvError ? err.code : 'INTERNAL_ERROR',
+    message: err && err.message ? err.message : String(err),
+  };
+  if (err && err.details !== undefined) payload.details = err.details;
+  return stableJsonStringify(payload);
+}
+
+async function main(argv) {
+  const args = parseArgs(argv);
+  const command = args._[0];
+
+  try {
+    if (!command || command === 'help' || command === '--help' || command === '-h') {
+      process.stdout.write(`${usage()}\n`);
+      return 0;
+    }
+
+    if (command === 'keygen') {
+      if (!args['key-dir']) {
+        throw new ProvError(ERROR_CODES.USAGE_ERROR, '缺少必填参数 --key-dir');
+      }
+      const r = await keygen({ keyDir: args['key-dir'], name: args.name || 'provguard' });
+      process.stdout.write(
+        `${stableJsonStringify({ status: 'KEYGEN_OK', ...r })}\n`,
+      );
+      return 0;
+    }
+
+    if (command === 'generate') {
+      const missing = ['artifact', 'key', 'out'].filter((k) => typeof args[k] !== 'string');
+      if (missing.length) {
+        throw new ProvError(
+          ERROR_CODES.USAGE_ERROR,
+          `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}`,
+        );
+      }
+      const r = await generate({ artifact: args.artifact, key: args.key, out: args.out });
+      process.stdout.write(
+        `${stableJsonStringify({
+          status: 'GENERATED',
+          proofVersion: r.proofVersion,
+          artifactDigest: r.artifactDigest,
+          fileCount: r.fileCount,
+          proofPath: r.proofPath,
+          sbomPath: r.sbomPath,
+          signaturePath: r.signaturePath,
+        })}\n`,
+      );
+      return 0;
+    }
+
+    if (command === 'verify') {
+      const missing = ['artifact', 'proof', 'signature', 'key'].filter((k) => typeof args[k] !== 'string');
+      if (missing.length) {
+        throw new ProvError(
+          ERROR_CODES.USAGE_ERROR,
+          `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}`,
+        );
+      }
+      const r = await verify({
+        artifact: args.artifact,
+        proof: args.proof,
+        signature: args.signature,
+        key: args.key,
+      });
+      process.stdout.write(`${stableJsonStringify(r)}\n`);
+      return 0;
+    }
+
+    throw new ProvError(ERROR_CODES.USAGE_ERROR, `未知子命令: ${command}`);
+  } catch (err) {
+    // stderr 仅输出机器可读 JSON；用法帮助走 stdout，避免污染错误流。
+    process.stderr.write(`${printMachineError(err)}\n`);
+    if (err instanceof ProvError && err.code === ERROR_CODES.USAGE_ERROR) {
+      process.stdout.write(`\n${usage()}\n`);
+    }
+    return 1;
+  }
+}
+
+// 仅作为脚本直接运行时执行 main；被测试 import 时不执行。
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main(process.argv.slice(2)).then((code) => {
+    process.exitCode = code;
+  });
+}
+
+export { main, ProvError, ERROR_CODES as CODES };
