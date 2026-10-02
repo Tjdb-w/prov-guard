@@ -5,6 +5,7 @@
 //   keygen   --key-dir <dir> [--name <prefix>]
 //   generate --artifact <path> --key <private-key> --out <dir>
 //   verify   --artifact <path> --proof <file> --signature <file> --key <public-key>
+//            [--sbom <file> --sbom-signature <file>]
 //
 // 所有输出均为 UTF-8；成功结果写 stdout，错误结果写 stderr。
 
@@ -350,6 +351,11 @@ export async function generate({ artifact, key, out }) {
   const sbom = await buildSbom(artifactAbs, outReal);
   const artifactDigest = computeArtifactDigest(sbom);
 
+  // SBOM 规范字节：稳定 JSON（去尾换行后的 UTF-8）。proof 中的 sbomDigest 与
+  // sbom.json.sig 绑定同一组字节，防止证明有效而 sbom.json 被整体替换。
+  const sbomCanonical = stableJsonStringify(sbom);
+  const sbomDigest = sha256Hex(sbomCanonical);
+
   const proof = {
     proofVersion: PROOF_VERSION,
     artifactName: basename(artifactAbs),
@@ -358,24 +364,30 @@ export async function generate({ artifact, key, out }) {
     size: sbom.files.reduce((n, f) => n + f.size, 0),
     generatedAt: nowIso(),
     signerKeyFingerprint,
+    sbomDigest,
     files: sbom.files,
   };
   // 稳定字段顺序：proof 先按既定顺序构造，再整体排序输出。
   const proofJson = stableJsonStringify(proof) + '\n';
-  const sbomJson = stableJsonStringify(sbom) + '\n';
+  const sbomJson = sbomCanonical + '\n';
 
   // 对证明的规范字节（不含尾部换行）签名，验证时使用同一规范形式。
   // Ed25519 为纯签名算法，不接受摘要算法参数，故用 sign(null, data, key)。
   const signature = cryptoSign(null, Buffer.from(proofJson.trimEnd(), 'utf8'), privateKey);
   const signatureB64 = signature.toString('base64') + '\n';
+  // 对 SBOM 规范字节单独签名，Base64 加换行保存。
+  const sbomSignature = cryptoSign(null, Buffer.from(sbomCanonical, 'utf8'), privateKey);
+  const sbomSignatureB64 = sbomSignature.toString('base64') + '\n';
 
   const proofPath = join(outReal, 'proof.json');
   const sbomPath = join(outReal, 'sbom.json');
   const sigPath = join(outReal, 'proof.json.sig');
+  const sbomSigPath = join(outReal, 'sbom.json.sig');
   try {
     await atomicWrite(proofPath, proofJson);
     await atomicWrite(sbomPath, sbomJson);
     await atomicWrite(sigPath, signatureB64);
+    await atomicWrite(sbomSigPath, sbomSignatureB64);
   } catch (err) {
     throw wrapFsError(err, '写入证明产物');
   }
@@ -384,7 +396,9 @@ export async function generate({ artifact, key, out }) {
     proofPath,
     sbomPath,
     signaturePath: sigPath,
+    sbomSignaturePath: sbomSigPath,
     artifactDigest,
+    sbomDigest,
     fileCount: sbom.files.length,
     proofVersion: PROOF_VERSION,
   };
@@ -407,19 +421,38 @@ async function atomicWrite(target, contents) {
 // verify
 // ---------------------------------------------------------------------------
 
-export async function verify({ artifact, proof: proofPath, signature: sigPath, key: pubKeyPath }) {
+export async function verify({
+  artifact,
+  proof: proofPath,
+  signature: sigPath,
+  key: pubKeyPath,
+  sbom: sbomPath,
+  sbomSignature: sbomSigPath,
+}) {
   const artifactAbs = resolve(artifact);
   const proofAbs = resolve(proofPath);
   const sigAbs = resolve(sigPath);
   const keyAbs = resolve(pubKeyPath);
 
+  // --sbom 与 --sbom-signature 必须成对出现；只给一者是用法错误。
+  const sbomMode = sbomPath !== undefined || sbomSigPath !== undefined;
+  if (sbomMode && (sbomPath === undefined || sbomSigPath === undefined)) {
+    throw new ProvError(ERROR_CODES.USAGE_ERROR, '--sbom 与 --sbom-signature 必须成对提供');
+  }
+  const sbomAbs = sbomMode ? resolve(sbomPath) : null;
+  const sbomSigAbs = sbomMode ? resolve(sbomSigPath) : null;
+
   // 1) 所有输入必须存在且可读。
-  for (const [p, label] of [
+  const inputs = [
     [artifactAbs, '产物'],
     [proofAbs, '证明文件'],
     [sigAbs, '签名文件'],
     [keyAbs, '公钥'],
-  ]) {
+  ];
+  if (sbomMode) {
+    inputs.push([sbomAbs, 'SBOM 文件'], [sbomSigAbs, 'SBOM 签名文件']);
+  }
+  for (const [p, label] of inputs) {
     try {
       await access(p, fsConstants.R_OK);
     } catch (err) {
@@ -516,12 +549,91 @@ export async function verify({ artifact, proof: proofPath, signature: sigPath, k
     );
   }
 
-  return {
+  // 7) SBOM 模式：校验 sbom.json 结构、proof.sbomDigest、SBOM 签名，
+  //    并确认 SBOM 清单与证明清单（进而与当前扫描）逐项一致。
+  let sbomDigest;
+  if (sbomMode) {
+    sbomDigest = await verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey });
+  }
+
+  const result = {
     status: 'VERIFIED',
     proofVersion: proof.proofVersion,
     artifactDigest: currentDigest,
     fileCount: currentSbom.files.length,
   };
+  if (sbomMode) result.sbomDigest = sbomDigest;
+  return result;
+}
+
+// SBOM 校验：结构 -> 摘要 -> 签名 -> 清单一致性。
+async function verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey }) {
+  // a) sbom.json 必须是可解析的 JSON 且结构合法 —— 否则 PROOF_INVALID。
+  const sbomText = await readFileUtf8(sbomAbs);
+  let sbom;
+  try {
+    sbom = JSON.parse(sbomText);
+  } catch {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, 'SBOM 文件不是合法的 JSON');
+  }
+  const sbomError = validateSbom(sbom);
+  if (sbomError) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, sbomError);
+  }
+
+  // b) 证明必须携带合法的 sbomDigest 字段。
+  if (typeof proof.sbomDigest !== 'string' || !/^[0-9a-f]{64}$/i.test(proof.sbomDigest)) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '证明缺少合法的 sbomDigest 字段');
+  }
+
+  // c) 重算 SBOM 规范字节摘要并与证明比对 —— 不一致说明 sbom.json 被替换或改动。
+  const canonicalSbom = stableJsonStringify(sbom);
+  const recomputed = sha256Hex(canonicalSbom);
+  if (recomputed.toLowerCase() !== proof.sbomDigest.toLowerCase()) {
+    throw new ProvError(
+      ERROR_CODES.INTEGRITY_MISMATCH,
+      'sbom.json 与证明记录的 sbomDigest 不一致（SBOM 可能被替换）',
+      { mismatches: [{ path: 'sbom.json', kind: 'content-modified' }] },
+    );
+  }
+
+  // d) SBOM 签名：合法 Base64 且 64 字节 —— 否则 PROOF_INVALID；验签失败 SIGNATURE_INVALID。
+  const sigText = await readFileUtf8(sbomSigAbs);
+  const sigB64 = sigText.replace(/\s+/g, '');
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, 'SBOM 签名文件不是合法的 Base64 内容');
+  }
+  const sigBuf = Buffer.from(sigB64, 'base64');
+  if (sigBuf.length !== 64) {
+    throw new ProvError(
+      ERROR_CODES.PROOF_INVALID,
+      `SBOM 签名长度非法（Ed25519 应为 64 字节，实际 ${sigBuf.length} 字节）`,
+    );
+  }
+  let sigOk = false;
+  try {
+    sigOk = cryptoVerify(null, Buffer.from(canonicalSbom, 'utf8'), publicKey, sigBuf);
+  } catch {
+    sigOk = false;
+  }
+  if (!sigOk) {
+    throw new ProvError(
+      ERROR_CODES.SIGNATURE_INVALID,
+      'SBOM 签名与 sbom.json 内容不匹配（SBOM 可能被改动，或签名已损坏）',
+    );
+  }
+
+  // e) SBOM 清单与证明清单逐项一致（证明与当前扫描已在前面比对，故三方一致）。
+  const mismatches = diffSbomAgainstProof(sbom, proof);
+  if (mismatches.length > 0) {
+    throw new ProvError(
+      ERROR_CODES.INTEGRITY_MISMATCH,
+      `SBOM 与证明清单存在 ${mismatches.length} 处差异`,
+      { mismatches },
+    );
+  }
+
+  return recomputed;
 }
 
 function inferExcludeDir(proofAbs, artifactAbs) {
@@ -559,8 +671,13 @@ function validateProof(proof) {
     return '证明字段缺失或类型非法: size';
   }
   if (!Array.isArray(proof.files)) return '证明字段缺失或类型非法: files';
+  return validateFileEntries(proof.files);
+}
+
+// 清单条目校验：proof.files 与 sbom.files 共用同一套规则。
+function validateFileEntries(files) {
   const seen = new Set();
-  for (const f of proof.files) {
+  for (const f of files) {
     if (f === null || typeof f !== 'object') return '清单条目必须是对象';
     if (typeof f.path !== 'string' || f.path.length === 0) return '清单条目 path 非法';
     if (f.path.includes('\\')) return `清单相对路径必须使用正斜杠: ${f.path}`;
@@ -576,6 +693,19 @@ function validateProof(proof) {
     if (typeof f.type !== 'string' || f.type.length === 0) return `清单条目类型非法: ${f.path}`;
   }
   return null;
+}
+
+function validateSbom(sbom) {
+  if (sbom === null || typeof sbom !== 'object' || Array.isArray(sbom)) {
+    return 'SBOM 顶层必须是 JSON 对象';
+  }
+  for (const k of ['schemaVersion', 'artifactName', 'rootType']) {
+    if (typeof sbom[k] !== 'string' || sbom[k].length === 0) {
+      return `SBOM 字段缺失或类型非法: ${k}`;
+    }
+  }
+  if (!Array.isArray(sbom.files)) return 'SBOM 字段缺失或类型非法: files';
+  return validateFileEntries(sbom.files);
 }
 
 // 返回差异列表；每条 {path, kind}。顶层摘要差异兜底。
@@ -607,6 +737,37 @@ function diffManifest(proof, currentSbom, currentDigest) {
     mismatches.push({ path: '.', kind: 'artifact-digest-mismatch' });
   }
   if (proof.fileName !== currentSbom.artifactName) {
+    mismatches.push({ path: '.', kind: 'artifact-name-mismatch' });
+  }
+
+  mismatches.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.kind < b.kind ? -1 : 1));
+  return mismatches;
+}
+
+// SBOM 清单与证明清单逐项比对；以证明为基准，kind 语义与 diffManifest 一致。
+function diffSbomAgainstProof(sbom, proof) {
+  const mismatches = [];
+  const sbomFiles = new Map(sbom.files.map((f) => [f.path, f]));
+  const proofFiles = new Map(proof.files.map((f) => [f.path, f]));
+
+  for (const [path, pf] of proofFiles) {
+    const sf = sbomFiles.get(path);
+    if (!sf) {
+      mismatches.push({ path, kind: 'missing' }); // 证明中存在、SBOM 中缺失
+      continue;
+    }
+    if (sf.sha256.toLowerCase() !== pf.sha256.toLowerCase()) {
+      mismatches.push({ path, kind: 'content-modified' });
+    } else if (sf.size !== pf.size) {
+      mismatches.push({ path, kind: 'size-mismatch' });
+    }
+  }
+  for (const path of sbomFiles.keys()) {
+    if (!proofFiles.has(path)) {
+      mismatches.push({ path, kind: 'added' }); // SBOM 中新出现的条目
+    }
+  }
+  if (sbom.artifactName !== proof.artifactName) {
     mismatches.push({ path: '.', kind: 'artifact-name-mismatch' });
   }
 
@@ -646,9 +807,10 @@ function usage() {
     '  provguard keygen   --key-dir <dir> [--name <prefix>]',
     '  provguard generate --artifact <path> --key <private.pem> --out <dir>',
     '  provguard verify   --artifact <path> --proof <proof.json> \\',
-    '                      --signature <proof.json.sig> --key <public.pem>',
+    '                      --signature <proof.json.sig> --key <public.pem> \\',
+    '                      [--sbom <sbom.json> --sbom-signature <sbom.json.sig>]',
     '',
-    'generate 输出: proof.json / proof.json.sig / sbom.json',
+    'generate 输出: proof.json / proof.json.sig / sbom.json / sbom.json.sig',
     '成功状态: VERIFIED；错误码见 README。',
   ].join('\n');
 }
@@ -702,6 +864,7 @@ async function main(argv) {
           proofPath: r.proofPath,
           sbomPath: r.sbomPath,
           signaturePath: r.signaturePath,
+          sbomSignaturePath: r.sbomSignaturePath,
         })}\n`,
       );
       return 0;
@@ -715,11 +878,19 @@ async function main(argv) {
           `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}`,
         );
       }
+      // --sbom 与 --sbom-signature 必须成对出现。
+      const hasSbom = typeof args.sbom === 'string';
+      const hasSbomSig = typeof args['sbom-signature'] === 'string';
+      if (hasSbom !== hasSbomSig) {
+        throw new ProvError(ERROR_CODES.USAGE_ERROR, '--sbom 与 --sbom-signature 必须成对提供');
+      }
       const r = await verify({
         artifact: args.artifact,
         proof: args.proof,
         signature: args.signature,
         key: args.key,
+        sbom: hasSbom ? args.sbom : undefined,
+        sbomSignature: hasSbomSig ? args['sbom-signature'] : undefined,
       });
       process.stdout.write(`${stableJsonStringify(r)}\n`);
       return 0;

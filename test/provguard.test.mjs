@@ -86,6 +86,18 @@ function verify(artifact, out, pub, overrides = {}) {
   ]);
 }
 
+function verifyWithSbom(artifact, out, pub, overrides = {}) {
+  return run([
+    'verify',
+    '--artifact', overrides.artifact ?? artifact,
+    '--proof', overrides.proof ?? join(out, 'proof.json'),
+    '--signature', overrides.signature ?? join(out, 'proof.json.sig'),
+    '--key', overrides.key ?? pub,
+    '--sbom', overrides.sbom ?? join(out, 'sbom.json'),
+    '--sbom-signature', overrides.sbomSignature ?? join(out, 'sbom.json.sig'),
+  ]);
+}
+
 // ---------------------------------------------------------------------------
 
 test('keygen 生成可用的 Ed25519 密钥对', () => {
@@ -315,4 +327,143 @@ test('未知子命令 -> USAGE_ERROR', () => {
   const r = run(['frobnicate']);
   assert.equal(r.code, 1);
   assert.equal(r.stderr.errorCode, 'USAGE_ERROR');
+});
+
+// ---------------------------------------------------------------------------
+// SBOM 签名保护
+// ---------------------------------------------------------------------------
+
+test('generate 产出 sbom.json.sig，proof 记录 sbomDigest，输出含 sbomSignaturePath', () => {
+  const k = keygen(paths.keys);
+  const g = generate(paths.art, k.priv, paths.out);
+  assert.ok(g.sbomSignaturePath.endsWith('sbom.json.sig'));
+
+  const proof = JSON.parse(readFileSync(join(paths.out, 'proof.json'), 'utf8'));
+  assert.match(proof.sbomDigest, /^[0-9a-f]{64}$/);
+
+  const sigText = readFileSync(join(paths.out, 'sbom.json.sig'), 'utf8');
+  assert.match(sigText, /^[A-Za-z0-9+/=]+\n$/);
+  assert.equal(Buffer.from(sigText.trim(), 'base64').length, 64);
+});
+
+test('verify 启用 SBOM 校验：成功并输出 sbomDigest', () => {
+  const k = keygen(paths.keys);
+  const g = generate(paths.art, k.priv, paths.out);
+  const v = verifyWithSbom(paths.art, paths.out, k.pub);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.artifactDigest, g.artifactDigest);
+  const proof = JSON.parse(readFileSync(join(paths.out, 'proof.json'), 'utf8'));
+  assert.equal(v.stdout.sbomDigest, proof.sbomDigest);
+});
+
+test('verify 不带 SBOM 参数时行为不变（stdout 无 sbomDigest）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const v = verify(paths.art, paths.out, k.pub);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.ok(!('sbomDigest' in v.stdout));
+});
+
+test('--sbom 与 --sbom-signature 只给一者 -> USAGE_ERROR', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const base = [
+    'verify',
+    '--artifact', paths.art,
+    '--proof', join(paths.out, 'proof.json'),
+    '--signature', join(paths.out, 'proof.json.sig'),
+    '--key', k.pub,
+  ];
+  const onlySbom = run([...base, '--sbom', join(paths.out, 'sbom.json')]);
+  assert.equal(onlySbom.code, 1);
+  assert.equal(onlySbom.stderr.errorCode, 'USAGE_ERROR');
+  const onlySig = run([...base, '--sbom-signature', join(paths.out, 'sbom.json.sig')]);
+  assert.equal(onlySig.code, 1);
+  assert.equal(onlySig.stderr.errorCode, 'USAGE_ERROR');
+});
+
+test('sbom.json 被替换/改动 -> INTEGRITY_MISMATCH（sbomDigest 不一致）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const sbomPath = join(paths.out, 'sbom.json');
+  const sbom = JSON.parse(readFileSync(sbomPath, 'utf8'));
+  sbom.files = [];
+  writeFileSync(sbomPath, JSON.stringify(sbom, null, 2) + '\n');
+  const v = verifyWithSbom(paths.art, paths.out, k.pub);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
+  assert.ok(v.stderr.details.mismatches.some((m) => m.path === 'sbom.json'));
+});
+
+test('SBOM 签名与 sbom.json 内容不匹配 -> SIGNATURE_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  // proof.json.sig 同为合法 64 字节签名，但签的是证明而非 SBOM。
+  const v = verifyWithSbom(paths.art, paths.out, k.pub, {
+    sbomSignature: join(paths.out, 'proof.json.sig'),
+  });
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('SBOM 签名非 Base64 -> PROOF_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const bad = join(root, 'bad-sbom.sig');
+  writeFileSync(bad, '!!! not base64 !!!');
+  const v = verifyWithSbom(paths.art, paths.out, k.pub, { sbomSignature: bad });
+  assert.equal(v.stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('SBOM 签名长度非法 -> PROOF_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const bad = join(root, 'short-sbom.sig');
+  writeFileSync(bad, Buffer.from('too-short').toString('base64'));
+  const v = verifyWithSbom(paths.art, paths.out, k.pub, { sbomSignature: bad });
+  assert.equal(v.stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('sbom.json 不是合法 JSON -> PROOF_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const bad = join(root, 'bad-sbom.json');
+  writeFileSync(bad, '{broken');
+  const v = verifyWithSbom(paths.art, paths.out, k.pub, { sbom: bad });
+  assert.equal(v.stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('sbom.json 缺字段 -> PROOF_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const bad = join(root, 'missing-sbom.json');
+  const sbom = JSON.parse(readFileSync(join(paths.out, 'sbom.json'), 'utf8'));
+  delete sbom.rootType;
+  writeFileSync(bad, JSON.stringify(sbom));
+  const v = verifyWithSbom(paths.art, paths.out, k.pub, { sbom: bad });
+  assert.equal(v.stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('SBOM 相关路径不存在 -> INPUT_NOT_FOUND', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  assert.equal(
+    verifyWithSbom(paths.art, paths.out, k.pub, { sbom: join(root, 'nope.json') }).stderr.errorCode,
+    'INPUT_NOT_FOUND',
+  );
+  assert.equal(
+    verifyWithSbom(paths.art, paths.out, k.pub, { sbomSignature: join(root, 'nope.sig') }).stderr.errorCode,
+    'INPUT_NOT_FOUND',
+  );
+});
+
+test('SBOM 模式下产物被篡改仍 -> INTEGRITY_MISMATCH', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  writeFileSync(join(paths.art, 'a.txt'), 'CHANGED\n');
+  const v = verifyWithSbom(paths.art, paths.out, k.pub);
+  assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
+  assert.ok(v.stderr.details.mismatches.some((m) => m.path === 'a.txt' && m.kind === 'content-modified'));
 });
