@@ -14,6 +14,7 @@
 - 构建产物的内容摘要、JSON 证明、独立签名文件与软件物料清单（SBOM）生成；
 - SBOM 纳入签名保护：`proof.json` 记录 `sbomDigest`，`sbom.json.sig` 对 SBOM 规范字节单独签名，防止证明有效而 `sbom.json` 被替换；
 - 证明验证：签名校验 + 逐文件完整性比对，覆盖字节改动、文件新增与删除；
+- 可选验证策略（`--policy`）：时间窗口、签名密钥指纹白名单、强制 SBOM、文件数与总大小上限；
 - 机器可读的错误码与非零退出码。
 
 ## 约定
@@ -82,18 +83,21 @@ node provguard.mjs verify \
   --proof <proof.json> \
   --signature <proof.json.sig> \
   --key <公钥.pem> \
-  [--sbom <sbom.json> --sbom-signature <sbom.json.sig>]
+  [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \
+  [--policy <policy.json>]
 ```
 
 验证顺序：检查输入存在且可读 → 解析公钥 → 解析并校验证明结构 → 校验签名格式 →
-比对签名公钥指纹并验签 → 重新扫描产物并逐项（摘要、文件名、大小、清单条目）比对。
+比对签名公钥指纹并验签 → 重新扫描产物并逐项（摘要、文件名、大小、清单条目）比对 →
+（可选）SBOM 校验 →（可选）策略校验。
 
 `--sbom` 与 `--sbom-signature` 为成对可选参数：只给一者返回 `USAGE_ERROR`；二者齐全时，
 在上述检查之后继续校验 `sbom.json` 的字段、相对路径与 SHA-256 格式，重算 SBOM 摘要并与
 证明中的 `sbomDigest` 比对，验证 `sbom.json.sig` 签名，最后确认 SBOM 清单、证明清单与
 当前扫描逐项一致。缺省不提供这两个参数时，验证行为与之前完全一致。
 
-成功时 stdout 输出（启用 SBOM 校验时额外包含 `sbomDigest`）：
+成功时 stdout 输出（启用 SBOM 校验时额外包含 `sbomDigest`；提供 `--policy` 且通过时
+额外包含 `"policyStatus": "PASS"`）：
 
 ```json
 {
@@ -103,6 +107,52 @@ node provguard.mjs verify \
   "fileCount": 4
 }
 ```
+
+### 4. 验证策略（可选 `--policy`）
+
+不传 `--policy` 时行为完全不变。策略文件为 UTF-8 JSON 对象，仅允许以下字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `policyVersion` | 字符串 | **必填**，当前固定为 `"1.0"` |
+| `proofNotBefore` | UTC ISO-8601 字符串 | 允许的最早 `proof.generatedAt`（闭区间，可选） |
+| `proofNotAfter` | UTC ISO-8601 字符串 | 允许的最晚 `proof.generatedAt`（闭区间，可选） |
+| `allowedKeyFingerprints` | 字符串数组 | 受信任签名公钥指纹白名单（64 位 SHA-256 十六进制，可选；缺省不约束，**显式空数组不接受**） |
+| `requireSbom` | 布尔 | 为 `true` 时必须成对提供 `--sbom`/`--sbom-signature` 且校验通过（可选，缺省 false） |
+| `maxFileCount` | 非负安全整数 | `proof.files.length` 上限（可选，含边界） |
+| `maxSize` | 非负安全整数 | `proof.size` 总字节数上限（可选，含边界） |
+
+规则细节：
+
+- 未知字段、非法类型或取值均报 `POLICY_INVALID`；`proofNotBefore` 晚于 `proofNotAfter`
+  同样为 `POLICY_INVALID`。
+- 时间仅接受以 `Z` 结尾的 UTC ISO-8601（如 `2026-10-03T12:00:00Z`，秒可带小数）；
+  `proof.generatedAt` 无法解析为该格式时记 `generated-at-invalid`，不再评估时间上下界。
+- 指纹比较大小写不敏感；文件数与大小上限均为“达到上限即通过”。
+- `requireSbom` 为 `false`（或缺省）时不禁止额外提供的 SBOM，仍按既有规则校验。
+- 策略只在签名、完整性、可选 SBOM 校验**全部通过后**加载执行；伪造、篡改等仍按原错误码
+  返回，不会落到策略结果。策略文件缺失报 `INPUT_NOT_FOUND`、不可读报 `PERMISSION_DENIED`。
+
+策略违规时 stderr 输出 `POLICY_VIOLATION`，`details.violations` 按
+**时间 → 密钥 → SBOM → 文件数 → 大小** 排序，每项含 `rule` 与 `observed`：
+
+```json
+{
+  "status": "ERROR",
+  "errorCode": "POLICY_VIOLATION",
+  "message": "策略校验未通过（2 项违规）",
+  "details": {
+    "violations": [
+      { "rule": "allowed-key-fingerprints", "observed": "<proof 中的指纹>" },
+      { "rule": "max-file-count", "observed": 7 }
+    ]
+  }
+}
+```
+
+可能的 `rule`：`generated-at-invalid` / `proof-not-before` / `proof-not-after` /
+`allowed-key-fingerprints` / `require-sbom`（`observed` 为 `"absent"`）/
+`max-file-count` / `max-size`。
 
 ## 错误码
 
@@ -119,12 +169,14 @@ node provguard.mjs verify \
 
 | 错误码 | 触发条件 |
 | --- | --- |
-| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥路径不存在 |
-| `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足） |
+| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥、策略文件路径不存在 |
+| `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足），包括策略文件不可读 |
 | `KEY_NOT_FOUND` | 公钥/私钥无法解析、不是 Ed25519，或验证时提供的公钥与证明记录的签名密钥不一致（错误公钥） |
 | `PROOF_INVALID` | 证明或 SBOM 的 JSON 不可解析、结构或摘要非法；签名文件不是合法 Base64 或长度非法 |
 | `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏） |
 | `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增/删除/重命名，或 `sbom.json` 与证明记录的 `sbomDigest` 不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch`） |
+| `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter` |
+| `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小排序列出全部违规，每项含 `rule` 与 `observed` |
 | `USAGE_ERROR` | 缺少必填参数、未知子命令，或 `--sbom` 与 `--sbom-signature` 只给一者 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
@@ -139,7 +191,8 @@ node provguard.mjs verify   --artifact dist/ \
   --signature attestation/proof.json.sig \
   --key keys/provguard.public.pem \
   --sbom attestation/sbom.json \
-  --sbom-signature attestation/sbom.json.sig
+  --sbom-signature attestation/sbom.json.sig \
+  --policy policy.json
 ```
 
 ## 测试
@@ -149,4 +202,6 @@ node --test
 ```
 
 测试以子进程驱动 CLI，覆盖正常往返、确定性、空目录与零字节文件、输出目录自排除，
-以及字节篡改、新增/删除、错误公钥、非法签名、非法证明、缺失路径与私钥不可解析等错误路径。
+以及字节篡改、新增/删除、错误公钥、非法签名、非法证明、缺失路径与私钥不可解析等错误路径；
+策略测试覆盖通过（PASS）、闭区间边界、指纹大小写不敏感、`requireSbom`、上限边界、
+违规排序、`generated-at-invalid`、策略文件各类非法情形、缺失/不可读以及篡改优先。
