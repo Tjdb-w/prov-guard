@@ -62,9 +62,13 @@ node provguard.mjs generate --artifact <产物路径> --key <私钥.pem> --out <
 
 | 文件 | 说明 |
 | --- | --- |
-| `proof.json` | 证明：证明版本、产物名、稳定产物摘要、总大小、生成时间、签名公钥指纹、逐文件清单 |
+| `proof.json` | 证明：证明版本、产物名、稳定产物摘要、SBOM 摘要（`sbomDigest`）、总大小、生成时间、签名公钥指纹、逐文件清单 |
 | `proof.json.sig` | 对证明规范字节的 Ed25519 签名（Base64），可单独保存与分发 |
-| `sbom.json` | 软件物料清单：按相对路径列出每个文件的 `path` / `sha256` / `size` / `type` |
+| `sbom.json` | 软件物料清单：`schemaVersion` / `artifactName` / `rootType`，并按相对路径列出每个文件的 `path` / `sha256` / `size` / `type` |
+| `sbom.json.sig` | 对 `sbom.json` 规范字节（去尾换行后的 UTF-8 规范 JSON）的 Ed25519 签名（Base64） |
+
+`sbomDigest` 是对 `sbom.json` 规范字节（去尾换行）的 SHA-256，随证明一起签名；
+因此替换或改动 `sbom.json` 会在验证时被发现。
 
 产物摘要是对“排序后的完整文件清单”做 SHA-256，因此任何字节变化、文件新增、删除或重命名都会改变摘要。
 同一产物在未改动时，跨多次生成的清单与产物摘要字节级一致（仅 `generatedAt` 变化，且不影响摘要）。
@@ -76,20 +80,28 @@ node provguard.mjs verify \
   --artifact <产物路径> \
   --proof <proof.json> \
   --signature <proof.json.sig> \
-  --key <公钥.pem>
+  --key <公钥.pem> \
+  [--sbom <sbom.json> --sbom-signature <sbom.json.sig>]
 ```
 
 验证顺序：检查输入存在且可读 → 解析公钥 → 解析并校验证明结构 → 校验签名格式 →
 比对签名公钥指纹并验签 → 重新扫描产物并逐项（摘要、文件名、大小、清单条目）比对。
 
-成功时 stdout 输出：
+`--sbom` 与 `--sbom-signature` 为成对参数，必须同时提供（只给一者返回 `USAGE_ERROR`）。
+二者齐全时，在上述检查通过后继续校验 SBOM：解析并校验 `sbom.json` 结构（字段、相对路径、
+SHA-256 格式）→ 重算其规范字节摘要并与证明中的 `sbomDigest` 比对 → 校验 `sbom.json.sig`
+签名 → 确认 SBOM 的 `files`、证明的 `files` 与当前扫描结果逐项一致。缺省不提供时，
+verify 行为与之前一致（旧版不含 `sbomDigest` 的证明仍可验证）。
+
+成功时 stdout 输出（启用 SBOM 校验时额外包含 `sbomDigest`）：
 
 ```json
 {
   "status": "VERIFIED",
   "proofVersion": "1.0",
   "artifactDigest": "<sha256>",
-  "fileCount": 4
+  "fileCount": 4,
+  "sbomDigest": "<sha256，仅启用 SBOM 校验时>"
 }
 ```
 
@@ -111,10 +123,10 @@ node provguard.mjs verify \
 | `INPUT_NOT_FOUND` | 产物、证明、签名或公钥路径不存在 |
 | `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足） |
 | `KEY_NOT_FOUND` | 公钥/私钥无法解析、不是 Ed25519，或验证时提供的公钥与证明记录的签名密钥不一致（错误公钥） |
-| `PROOF_INVALID` | 证明 JSON 不可解析或结构非法；签名文件不是合法 Base64 或长度非法 |
-| `SIGNATURE_INVALID` | 公钥正确但签名与证明内容不匹配（证明被改动或签名损坏） |
-| `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增或删除；`details.mismatches` 给出差异路径与类型（`content-modified` / `added` / `missing` 等） |
-| `USAGE_ERROR` | 缺少必填参数或未知子命令 |
+| `PROOF_INVALID` | 证明或 SBOM 的 JSON 不可解析或结构非法（含摘要格式非法）；签名文件不是合法 Base64 或长度非法 |
+| `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏） |
+| `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增或删除，或 SBOM 摘要/清单与证明不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch` / `sbom-digest-mismatch`） |
+| `USAGE_ERROR` | 缺少必填参数、未知子命令，或 `--sbom` 与 `--sbom-signature` 未成对提供 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
 
@@ -126,7 +138,9 @@ node provguard.mjs generate --artifact dist/ --key keys/provguard.private.pem --
 node provguard.mjs verify   --artifact dist/ \
   --proof attestation/proof.json \
   --signature attestation/proof.json.sig \
-  --key keys/provguard.public.pem
+  --key keys/provguard.public.pem \
+  --sbom attestation/sbom.json \
+  --sbom-signature attestation/sbom.json.sig
 ```
 
 ## 测试
