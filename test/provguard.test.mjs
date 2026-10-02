@@ -1,6 +1,7 @@
 // Prov Guard 端到端测试：以子进程方式驱动 provguard.mjs CLI。
 // 运行：node --test
 import { spawnSync } from 'node:child_process';
+import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -466,4 +467,345 @@ test('SBOM 模式下产物被篡改仍 -> INTEGRITY_MISMATCH', () => {
   const v = verifyWithSbom(paths.art, paths.out, k.pub);
   assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
   assert.ok(v.stderr.details.mismatches.some((m) => m.path === 'a.txt' && m.kind === 'content-modified'));
+});
+
+// ---------------------------------------------------------------------------
+// 验证策略（--policy）
+// ---------------------------------------------------------------------------
+
+function writePolicy(obj) {
+  const p = join(root, 'policy.json');
+  writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj));
+  return p;
+}
+
+function verifyWithPolicy(artifact, out, pub, policyPath, overrides = {}) {
+  const args = [
+    'verify',
+    '--artifact', overrides.artifact ?? artifact,
+    '--proof', overrides.proof ?? join(out, 'proof.json'),
+    '--signature', overrides.signature ?? join(out, 'proof.json.sig'),
+    '--key', overrides.key ?? pub,
+    '--policy', policyPath,
+  ];
+  if (overrides.sbom) args.push('--sbom', overrides.sbom);
+  if (overrides.sbomSignature) args.push('--sbom-signature', overrides.sbomSignature);
+  return run(args);
+}
+
+function readProof(out) {
+  return JSON.parse(readFileSync(join(out, 'proof.json'), 'utf8'));
+}
+
+// 与 provguard.mjs 相同的稳定序列化：键排序、两空格缩进。
+function stableJson(value) {
+  const sortDeep = (v) => {
+    if (Array.isArray(v)) return v.map(sortDeep);
+    if (v !== null && typeof v === 'object') {
+      const o = {};
+      for (const k of Object.keys(v).sort()) o[k] = sortDeep(v[k]);
+      return o;
+    }
+    return v;
+  };
+  return JSON.stringify(sortDeep(value), null, 2);
+}
+
+// 修改证明并重新签名（用于构造“签名有效但策略不通过”的场景）。
+function resignProof(out, privPath, mutate) {
+  const proofPath = join(out, 'proof.json');
+  const proof = JSON.parse(readFileSync(proofPath, 'utf8'));
+  mutate(proof);
+  const canonical = stableJson(proof);
+  writeFileSync(proofPath, `${canonical}\n`);
+  const priv = createPrivateKey(readFileSync(privPath));
+  const sig = cryptoSign(null, Buffer.from(canonical, 'utf8'), priv);
+  writeFileSync(join(out, 'proof.json.sig'), `${sig.toString('base64')}\n`);
+  return proof;
+}
+
+test('策略全部满足 -> VERIFIED 且 policyStatus 为 PASS', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({
+    policyVersion: '1.0',
+    proofNotBefore: '2000-01-01T00:00:00Z',
+    proofNotAfter: '2100-01-01T00:00:00Z',
+    allowedKeyFingerprints: [proof.signerKeyFingerprint],
+    requireSbom: true,
+    maxFileCount: 4,
+    maxSize: proof.size,
+  });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy, {
+    sbom: join(paths.out, 'sbom.json'),
+    sbomSignature: join(paths.out, 'sbom.json.sig'),
+  });
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+test('仅 policyVersion 的最简策略 -> PASS；不带 --policy 时无 policyStatus 字段', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const v1 = verifyWithPolicy(paths.art, paths.out, k.pub, writePolicy({ policyVersion: '1.0' }));
+  assert.equal(v1.code, 0, JSON.stringify(v1.stderr));
+  assert.equal(v1.stdout.policyStatus, 'PASS');
+
+  const v2 = verify(paths.art, paths.out, k.pub);
+  assert.equal(v2.code, 0, JSON.stringify(v2.stderr));
+  assert.ok(!('policyStatus' in v2.stdout));
+});
+
+test('指纹大小写不敏感：策略中指纹大写仍 PASS', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({
+    policyVersion: '1.0',
+    allowedKeyFingerprints: [proof.signerKeyFingerprint.toUpperCase()],
+  });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+test('生成时间晚于 proofNotAfter -> POLICY_VIOLATION / generated-at-after-not-after', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({ policyVersion: '1.0', proofNotAfter: '2000-01-01T00:00:00Z' });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.code, 1);
+  assert.equal(v.stdout, null);
+  assert.equal(v.stderr.status, 'ERROR');
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'generated-at-after-not-after', observed: proof.generatedAt },
+  ]);
+});
+
+test('生成时间早于 proofNotBefore -> POLICY_VIOLATION / generated-at-before-not-before', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({ policyVersion: '1.0', proofNotBefore: '2100-01-01T00:00:00Z' });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'generated-at-before-not-before', observed: proof.generatedAt },
+  ]);
+});
+
+test('时间边界为闭区间：generatedAt 恰等于边界时通过', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({
+    policyVersion: '1.0',
+    proofNotBefore: proof.generatedAt,
+    proofNotAfter: proof.generatedAt,
+  });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+test('签名密钥指纹不在信任列表 -> POLICY_VIOLATION / key-fingerprint-not-allowed', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({
+    policyVersion: '1.0',
+    allowedKeyFingerprints: ['0'.repeat(64)],
+  });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'key-fingerprint-not-allowed', observed: proof.signerKeyFingerprint },
+  ]);
+});
+
+test('requireSbom 为 true 但未提供 SBOM -> POLICY_VIOLATION / sbom-required；提供则通过', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const policy = writePolicy({ policyVersion: '1.0', requireSbom: true });
+
+  const v1 = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v1.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v1.stderr.details.violations, [{ rule: 'sbom-required', observed: false }]);
+
+  const v2 = verifyWithPolicy(paths.art, paths.out, k.pub, policy, {
+    sbom: join(paths.out, 'sbom.json'),
+    sbomSignature: join(paths.out, 'sbom.json.sig'),
+  });
+  assert.equal(v2.code, 0, JSON.stringify(v2.stderr));
+  assert.equal(v2.stdout.policyStatus, 'PASS');
+});
+
+test('requireSbom 为 false 不禁止额外 SBOM', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const policy = writePolicy({ policyVersion: '1.0', requireSbom: false });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy, {
+    sbom: join(paths.out, 'sbom.json'),
+    sbomSignature: join(paths.out, 'sbom.json.sig'),
+  });
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+test('文件数与总大小超限 -> POLICY_VIOLATION，违规按规则排序', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({
+    policyVersion: '1.0',
+    proofNotAfter: '2000-01-01T00:00:00Z',
+    allowedKeyFingerprints: ['0'.repeat(64)],
+    maxFileCount: 3,
+    maxSize: proof.size - 1,
+  });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(
+    v.stderr.details.violations.map((x) => x.rule),
+    ['generated-at-after-not-after', 'key-fingerprint-not-allowed', 'file-count-exceeded', 'size-exceeded'],
+  );
+  const byRule = Object.fromEntries(v.stderr.details.violations.map((x) => [x.rule, x.observed]));
+  assert.equal(byRule['file-count-exceeded'], 4);
+  assert.equal(byRule['size-exceeded'], proof.size);
+});
+
+test('上限含边界：maxFileCount/maxSize 恰好相等时通过', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof(paths.out);
+  const policy = writePolicy({
+    policyVersion: '1.0',
+    maxFileCount: proof.files.length,
+    maxSize: proof.size,
+  });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+test('generatedAt 非法（签名有效）-> POLICY_VIOLATION / generated-at-invalid', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  resignProof(paths.out, k.priv, (p) => {
+    p.generatedAt = 'not-a-time';
+  });
+  const policy = writePolicy({ policyVersion: '1.0', proofNotAfter: '2100-01-01T00:00:00Z' });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'generated-at-invalid', observed: 'not-a-time' },
+  ]);
+});
+
+test('策略不输出部分成功：违规时 stdout 无 VERIFIED', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const policy = writePolicy({ policyVersion: '1.0', maxFileCount: 0 });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.code, 1);
+  assert.equal(v.stdout, null);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+});
+
+test('产物被篡改时即使有策略也按原错误码返回（INTEGRITY_MISMATCH）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  writeFileSync(join(paths.art, 'a.txt'), 'CHANGED\n');
+  const policy = writePolicy({ policyVersion: '1.0', maxFileCount: 100 });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
+});
+
+test('签名无效时即使有策略也按原错误码返回（SIGNATURE_INVALID）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proofPath = join(paths.out, 'proof.json');
+  const proof = JSON.parse(readFileSync(proofPath, 'utf8'));
+  proof.generatedAt = '2000-01-01T00:00:00.000Z';
+  writeFileSync(proofPath, `${JSON.stringify(proof, null, 2)}\n`);
+  const policy = writePolicy({ policyVersion: '1.0' });
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, policy);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('策略文件不存在 -> INPUT_NOT_FOUND', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const v = verifyWithPolicy(paths.art, paths.out, k.pub, join(root, 'nope-policy.json'));
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'INPUT_NOT_FOUND');
+});
+
+test('策略 JSON 不可解析或顶层非对象 -> POLICY_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  for (const content of ['{broken', '[1,2]', '"str"', '42', 'null']) {
+    const v = verifyWithPolicy(paths.art, paths.out, k.pub, writePolicy(content));
+    assert.equal(v.code, 1, content);
+    assert.equal(v.stderr.errorCode, 'POLICY_INVALID', content);
+  }
+});
+
+test('策略缺 policyVersion 或取值不符 -> POLICY_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  for (const obj of [{}, { policyVersion: '2.0' }, { policyVersion: 1 }]) {
+    const v = verifyWithPolicy(paths.art, paths.out, k.pub, writePolicy(obj));
+    assert.equal(v.stderr.errorCode, 'POLICY_INVALID', JSON.stringify(obj));
+  }
+});
+
+test('策略含未知字段 -> POLICY_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const v = verifyWithPolicy(
+    paths.art, paths.out, k.pub,
+    writePolicy({ policyVersion: '1.0', unexpected: true }),
+  );
+  assert.equal(v.stderr.errorCode, 'POLICY_INVALID');
+});
+
+test('策略字段类型或取值非法 -> POLICY_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const badPolicies = [
+    { policyVersion: '1.0', proofNotBefore: 'not-a-time' },
+    { policyVersion: '1.0', proofNotAfter: '2026-01-01' }, // 缺时间部分
+    { policyVersion: '1.0', allowedKeyFingerprints: [] }, // 空数组不接受
+    { policyVersion: '1.0', allowedKeyFingerprints: 'abc' },
+    { policyVersion: '1.0', allowedKeyFingerprints: ['xyz'] },
+    { policyVersion: '1.0', requireSbom: 'yes' },
+    { policyVersion: '1.0', maxFileCount: -1 },
+    { policyVersion: '1.0', maxFileCount: 1.5 },
+    { policyVersion: '1.0', maxSize: Number.MAX_SAFE_INTEGER + 1 },
+    { policyVersion: '1.0', maxSize: '100' },
+  ];
+  for (const obj of badPolicies) {
+    const v = verifyWithPolicy(paths.art, paths.out, k.pub, writePolicy(obj));
+    assert.equal(v.code, 1, JSON.stringify(obj));
+    assert.equal(v.stderr.errorCode, 'POLICY_INVALID', JSON.stringify(obj));
+  }
+});
+
+test('proofNotBefore 晚于 proofNotAfter -> POLICY_INVALID', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const v = verifyWithPolicy(
+    paths.art, paths.out, k.pub,
+    writePolicy({
+      policyVersion: '1.0',
+      proofNotBefore: '2100-01-01T00:00:00Z',
+      proofNotAfter: '2000-01-01T00:00:00Z',
+    }),
+  );
+  assert.equal(v.stderr.errorCode, 'POLICY_INVALID');
 });

@@ -5,7 +5,7 @@
 //   keygen   --key-dir <dir> [--name <prefix>]
 //   generate --artifact <path> --key <private-key> --out <dir>
 //   verify   --artifact <path> --proof <file> --signature <file> --key <public-key>
-//            [--sbom <file> --sbom-signature <file>]
+//            [--sbom <file> --sbom-signature <file>] [--policy <policy.json>]
 //
 // 所有输出均为 UTF-8；成功结果写 stdout，错误结果写 stderr。
 
@@ -35,6 +35,8 @@ export const ERROR_CODES = Object.freeze({
   SIGNATURE_INVALID: 'SIGNATURE_INVALID',
   KEY_NOT_FOUND: 'KEY_NOT_FOUND',
   INTEGRITY_MISMATCH: 'INTEGRITY_MISMATCH',
+  POLICY_INVALID: 'POLICY_INVALID',
+  POLICY_VIOLATION: 'POLICY_VIOLATION',
   USAGE_ERROR: 'USAGE_ERROR',
 });
 
@@ -428,6 +430,7 @@ export async function verify({
   key: pubKeyPath,
   sbom: sbomPath,
   sbomSignature: sbomSigPath,
+  policy: policyPath,
 }) {
   const artifactAbs = resolve(artifact);
   const proofAbs = resolve(proofPath);
@@ -556,6 +559,22 @@ export async function verify({
     sbomDigest = await verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey });
   }
 
+  // 8) 策略评估：仅在签名、完整性、可选 SBOM 校验全部通过后执行；
+  //    此前的伪造/篡改仍按原错误码返回，策略不产生部分成功输出。
+  let policyStatus;
+  if (policyPath !== undefined) {
+    const policy = await loadPolicy(resolve(policyPath));
+    const violations = evaluatePolicy(policy, proof, sbomMode);
+    if (violations.length > 0) {
+      throw new ProvError(
+        ERROR_CODES.POLICY_VIOLATION,
+        `策略校验未通过（${violations.length} 项违规）`,
+        { violations },
+      );
+    }
+    policyStatus = 'PASS';
+  }
+
   const result = {
     status: 'VERIFIED',
     proofVersion: proof.proofVersion,
@@ -563,6 +582,7 @@ export async function verify({
     fileCount: currentSbom.files.length,
   };
   if (sbomMode) result.sbomDigest = sbomDigest;
+  if (policyStatus) result.policyStatus = policyStatus;
   return result;
 }
 
@@ -634,6 +654,147 @@ async function verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey }) {
   }
 
   return recomputed;
+}
+
+// ---------------------------------------------------------------------------
+// 策略（verify --policy）：在签名、完整性与可选 SBOM 校验全部通过后评估。
+// 策略文件为 UTF-8 JSON 对象，仅允许以下字段；未知字段、非法类型或取值
+// 一律 POLICY_INVALID，且不会产生部分成功输出。
+// ---------------------------------------------------------------------------
+
+export const POLICY_VERSION = '1.0';
+
+const POLICY_KEYS = new Set([
+  'policyVersion',
+  'proofNotBefore',
+  'proofNotAfter',
+  'allowedKeyFingerprints',
+  'requireSbom',
+  'maxFileCount',
+  'maxSize',
+]);
+
+// UTC ISO-8601：必须显式携带时区指示（Z 或 ±hh:mm），且能解析为有效时刻。
+const ISO8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+// 解析成功返回毫秒时间戳，否则返回 null。
+function parseIsoTime(value) {
+  if (typeof value !== 'string' || !ISO8601_RE.test(value)) return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+async function loadPolicy(policyAbs) {
+  let text;
+  try {
+    text = await readFile(policyAbs, 'utf8');
+  } catch (err) {
+    // 缺失 -> INPUT_NOT_FOUND；不可读 -> PERMISSION_DENIED。
+    throw wrapFsError(err, '读取策略文件');
+  }
+  let policy;
+  try {
+    policy = JSON.parse(text);
+  } catch {
+    throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略文件不是合法的 JSON');
+  }
+  const policyError = validatePolicy(policy);
+  if (policyError) {
+    throw new ProvError(ERROR_CODES.POLICY_INVALID, policyError);
+  }
+  return policy;
+}
+
+function validatePolicy(policy) {
+  if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
+    return '策略顶层必须是 JSON 对象';
+  }
+  for (const key of Object.keys(policy)) {
+    if (!POLICY_KEYS.has(key)) return `策略包含未知字段: ${key}`;
+  }
+  // policyVersion 必填，且只接受字符串 "1.0"。
+  if (policy.policyVersion !== POLICY_VERSION) {
+    return `策略字段缺失或取值非法: policyVersion（应为 "${POLICY_VERSION}"）`;
+  }
+  let notBefore = null;
+  let notAfter = null;
+  if (policy.proofNotBefore !== undefined) {
+    notBefore = parseIsoTime(policy.proofNotBefore);
+    if (notBefore === null) return '策略字段非法: proofNotBefore 必须是 UTC ISO-8601 时间';
+  }
+  if (policy.proofNotAfter !== undefined) {
+    notAfter = parseIsoTime(policy.proofNotAfter);
+    if (notAfter === null) return '策略字段非法: proofNotAfter 必须是 UTC ISO-8601 时间';
+  }
+  if (notBefore !== null && notAfter !== null && notBefore > notAfter) {
+    return '策略字段非法: proofNotBefore 晚于 proofNotAfter';
+  }
+  // 指纹列表缺省不约束；一旦给出必须是非空数组，元素为 64 位 SHA-256 十六进制。
+  if (policy.allowedKeyFingerprints !== undefined) {
+    const fps = policy.allowedKeyFingerprints;
+    if (!Array.isArray(fps) || fps.length === 0) {
+      return '策略字段非法: allowedKeyFingerprints 必须是非空数组';
+    }
+    for (const fp of fps) {
+      if (typeof fp !== 'string' || !/^[0-9a-f]{64}$/i.test(fp)) {
+        return '策略字段非法: allowedKeyFingerprints 元素必须是 64 位 SHA-256 十六进制';
+      }
+    }
+  }
+  if (policy.requireSbom !== undefined && typeof policy.requireSbom !== 'boolean') {
+    return '策略字段非法: requireSbom 必须是布尔值';
+  }
+  for (const k of ['maxFileCount', 'maxSize']) {
+    if (policy[k] !== undefined && (!Number.isSafeInteger(policy[k]) || policy[k] < 0)) {
+      return `策略字段非法: ${k} 必须是非负安全整数`;
+    }
+  }
+  return null;
+}
+
+// 评估策略，返回违规列表（空数组表示通过）。
+// 违规按 时间 -> 密钥 -> SBOM -> 文件数 -> 大小 的顺序排列，每条含 rule 与 observed。
+function evaluatePolicy(policy, proof, sbomProvided) {
+  const violations = [];
+
+  // 时间：generatedAt 必须可解析，且落在 [proofNotBefore, proofNotAfter] 闭区间。
+  const generatedAtMs = parseIsoTime(proof.generatedAt);
+  if (generatedAtMs === null) {
+    violations.push({ rule: 'generated-at-invalid', observed: proof.generatedAt });
+  } else {
+    const notBefore = parseIsoTime(policy.proofNotBefore);
+    const notAfter = parseIsoTime(policy.proofNotAfter);
+    if (notBefore !== null && generatedAtMs < notBefore) {
+      violations.push({ rule: 'generated-at-before-not-before', observed: proof.generatedAt });
+    }
+    if (notAfter !== null && generatedAtMs > notAfter) {
+      violations.push({ rule: 'generated-at-after-not-after', observed: proof.generatedAt });
+    }
+  }
+
+  // 密钥：签名密钥指纹必须命中信任列表（大小写不敏感）。
+  if (policy.allowedKeyFingerprints !== undefined) {
+    const allowed = new Set(policy.allowedKeyFingerprints.map((f) => f.toLowerCase()));
+    if (!allowed.has(proof.signerKeyFingerprint.toLowerCase())) {
+      violations.push({ rule: 'key-fingerprint-not-allowed', observed: proof.signerKeyFingerprint });
+    }
+  }
+
+  // SBOM：requireSbom 为 true 时必须成对提供 --sbom/--sbom-signature 且校验通过
+  // （有效性已在策略评估前完成检查，此处只确认是否提供）；为 false 时不禁止额外 SBOM。
+  if (policy.requireSbom === true && !sbomProvided) {
+    violations.push({ rule: 'sbom-required', observed: false });
+  }
+
+  // 文件数与总大小上限（含边界，超过才算违规）。
+  if (policy.maxFileCount !== undefined && proof.files.length > policy.maxFileCount) {
+    violations.push({ rule: 'file-count-exceeded', observed: proof.files.length });
+  }
+  if (policy.maxSize !== undefined && proof.size > policy.maxSize) {
+    violations.push({ rule: 'size-exceeded', observed: proof.size });
+  }
+
+  return violations;
 }
 
 function inferExcludeDir(proofAbs, artifactAbs) {
@@ -808,7 +969,8 @@ function usage() {
     '  provguard generate --artifact <path> --key <private.pem> --out <dir>',
     '  provguard verify   --artifact <path> --proof <proof.json> \\',
     '                      --signature <proof.json.sig> --key <public.pem> \\',
-    '                      [--sbom <sbom.json> --sbom-signature <sbom.json.sig>]',
+    '                      [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \\',
+    '                      [--policy <policy.json>]',
     '',
     'generate 输出: proof.json / proof.json.sig / sbom.json / sbom.json.sig',
     '成功状态: VERIFIED；错误码见 README。',
@@ -891,6 +1053,7 @@ async function main(argv) {
         key: args.key,
         sbom: hasSbom ? args.sbom : undefined,
         sbomSignature: hasSbomSig ? args['sbom-signature'] : undefined,
+        policy: typeof args.policy === 'string' ? args.policy : undefined,
       });
       process.stdout.write(`${stableJsonStringify(r)}\n`);
       return 0;
