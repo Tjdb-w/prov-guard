@@ -37,6 +37,7 @@ export const ERROR_CODES = Object.freeze({
   INTEGRITY_MISMATCH: 'INTEGRITY_MISMATCH',
   POLICY_INVALID: 'POLICY_INVALID',
   POLICY_VIOLATION: 'POLICY_VIOLATION',
+  SYMLINK_INVALID: 'SYMLINK_INVALID',
   USAGE_ERROR: 'USAGE_ERROR',
 });
 
@@ -99,11 +100,39 @@ export function keyFingerprint(keyObj) {
 // ---------------------------------------------------------------------------
 // 产物扫描：递归列出全部常规文件（含符号链接解引用后的目标），
 // 空目录自然产生空清单；零字节文件按真实文件记录。
+// 符号链接安全规则（按真实路径判定）：
+//   - 目标越出产物根目录                 -> SYMLINK_INVALID / outside-root；
+//   - 目标为当前递归祖先链上的目录（含根目录自身），或链接互相成环（ELOOP）
+//                                        -> SYMLINK_INVALID / cycle；
+//   - 指向根目录内部普通文件/目录的链接按链接路径记录目标内容；
+//     祖先链之外的重复目标允许展开（有向无环，不会形成回路）。
+// 判定在读取目标内容之前完成，危险链接不会被解引用读取。
 // ---------------------------------------------------------------------------
+
+// 符号链接安全检查失败：携带相对路径与原因（cycle / outside-root）。
+function symlinkError(fullPath, rootDir, reason) {
+  const relPath = toPosix(relative(rootDir, fullPath));
+  const message =
+    reason === 'cycle'
+      ? `符号链接形成回路: ${relPath}`
+      : `符号链接越出产物根目录: ${relPath}`;
+  return new ProvError(ERROR_CODES.SYMLINK_INVALID, message, { path: relPath, reason });
+}
+
+// 解析真实路径；底层错误按既有归类转换。
+async function realPathOf(p, context) {
+  try {
+    return await realpath(p);
+  } catch (err) {
+    throw wrapFsError(err, context);
+  }
+}
 
 async function walkFiles(rootDir) {
   const found = [];
-  async function walk(dir) {
+  const rootReal = await realPathOf(rootDir, '读取产物目录');
+  // chain 为当前递归路径上各级目录的真实路径，用于识别指回祖先的链接回路。
+  async function walk(dir, chain) {
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -113,24 +142,39 @@ async function walkFiles(rootDir) {
     for (const entry of entries) {
       const full = join(dir, entry.name);
       if (entry.isDirectory()) {
-        await walk(full);
+        await walk(full, [...chain, await realPathOf(full, '读取产物目录')]);
       } else if (entry.isFile()) {
         found.push(full);
       } else if (entry.isSymbolicLink()) {
-        // 解引用后按目标类型处理：指向目录则继续递归，指向文件则记录。
+        // 先解析真实目标并做安全判定，再按目标类型处理：
+        // 指向目录则继续递归，指向文件则按链接路径记录。
+        let targetReal;
+        try {
+          targetReal = await realpath(full);
+        } catch (err) {
+          // 链接互相指向成环（如 a -> b、b -> a）时 realpath 报 ELOOP。
+          if (err && err.code === 'ELOOP') throw symlinkError(full, rootDir, 'cycle');
+          throw wrapFsError(err, '读取符号链接');
+        }
+        if (!isWithin(targetReal, rootReal)) {
+          throw symlinkError(full, rootDir, 'outside-root');
+        }
+        if (chain.includes(targetReal)) {
+          throw symlinkError(full, rootDir, 'cycle');
+        }
         let target;
         try {
           target = await stat(full);
         } catch (err) {
           throw wrapFsError(err, '读取符号链接');
         }
-        if (target.isDirectory()) await walk(full);
+        if (target.isDirectory()) await walk(full, [...chain, targetReal]);
         else if (target.isFile()) found.push(full);
       }
       // 其他特殊文件（套接字/设备等）忽略。
     }
   }
-  await walk(rootDir);
+  await walk(rootDir, [rootReal]);
   return found;
 }
 

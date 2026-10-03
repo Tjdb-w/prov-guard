@@ -15,6 +15,8 @@
 - SBOM 纳入签名保护：`proof.json` 记录 `sbomDigest`，`sbom.json.sig` 对 SBOM 规范字节单独签名，防止证明有效而 `sbom.json` 被替换；
 - 证明验证：签名校验 + 逐文件完整性比对，覆盖字节改动、文件新增与删除；
 - 可选验证策略（`--policy`）：时间窗口、签名密钥指纹白名单、强制 SBOM、文件数与总大小上限；
+- 目录扫描的符号链接安全处理：指向产物根目录内部文件/目录的链接按链接路径记录目标内容；
+  形成回路或越出产物根目录的链接以 `SYMLINK_INVALID` 失败，不会继续递归或读取外部内容；
 - 机器可读的错误码与非零退出码。
 
 ## 约定
@@ -28,6 +30,9 @@
 - 清单中的相对路径统一使用正斜杠（`/`），跨平台一致。
 - 时间字段（`generatedAt`）只写入证明，不参与产物摘要或任何文件摘要。
 - 空目录自然产生空文件列表；零字节文件按真实文件记录。
+- 目录内的符号链接按真实路径判定：指向根目录内部普通文件或目录的链接，按链接路径记录
+  目标内容（目录链接会展开其下文件）；链接形成回路（指回祖先目录或互相成环）或目标越出
+  产物根目录时，扫描以 `SYMLINK_INVALID` 失败，不继续递归、不读取外部内容。
 
 ## 运行环境
 
@@ -177,6 +182,7 @@ node provguard.mjs verify \
 | `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增/删除/重命名，或 `sbom.json` 与证明记录的 `sbomDigest` 不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch`） |
 | `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter` |
 | `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小排序列出全部违规，每项含 `rule` 与 `observed` |
+| `SYMLINK_INVALID` | 目录扫描发现危险符号链接：形成回路（`details.reason` 为 `cycle`）或目标越出产物根目录（`details.reason` 为 `outside-root`）；`details.path` 为链接的相对路径。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败 |
 | `USAGE_ERROR` | 缺少必填参数、未知子命令，或 `--sbom` 与 `--sbom-signature` 只给一者 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
@@ -204,4 +210,6 @@ node --test
 测试以子进程驱动 CLI，覆盖正常往返、确定性、空目录与零字节文件、输出目录自排除，
 以及字节篡改、新增/删除、错误公钥、非法签名、非法证明、缺失路径与私钥不可解析等错误路径；
 策略测试覆盖通过（PASS）、闭区间边界、指纹大小写不敏感、`requireSbom`、上限边界、
-违规排序、`generated-at-invalid`、策略文件各类非法情形、缺失/不可读以及篡改优先。
+违规排序、`generated-at-invalid`、策略文件各类非法情形、缺失/不可读以及篡改优先；
+符号链接测试覆盖越出根目录（outside-root）、指回祖先与互相成环（cycle）、ELOOP、
+generate 失败前不写证明、verify 扫描阶段报错，以及安全内部链接的记录与稳定性。
