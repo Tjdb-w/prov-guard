@@ -37,6 +37,7 @@ export const ERROR_CODES = Object.freeze({
   INTEGRITY_MISMATCH: 'INTEGRITY_MISMATCH',
   POLICY_INVALID: 'POLICY_INVALID',
   POLICY_VIOLATION: 'POLICY_VIOLATION',
+  SYMLINK_INVALID: 'SYMLINK_INVALID',
   USAGE_ERROR: 'USAGE_ERROR',
 });
 
@@ -97,40 +98,91 @@ export function keyFingerprint(keyObj) {
 }
 
 // ---------------------------------------------------------------------------
-// 产物扫描：递归列出全部常规文件（含符号链接解引用后的目标），
+// 产物扫描：递归列出全部常规文件。
+// 符号链接安全处理：
+//   - 指向产物根目录内部的普通文件/目录：按“链接路径”记录目标内容（既有语义）；
+//   - 链接形成回路（ELOOP，或指向当前递归栈上的祖先目录）：SYMLINK_INVALID / cycle；
+//   - 链接目标解析到产物根目录之外：SYMLINK_INVALID / outside-root。
+// 一旦命中上述情况立即失败，不继续递归、不读取链接外部内容、不返回部分清单。
+// 悬空链接等解析失败沿用既有归类（ENOENT -> INPUT_NOT_FOUND），不冒充 SYMLINK_INVALID。
 // 空目录自然产生空清单；零字节文件按真实文件记录。
 // ---------------------------------------------------------------------------
 
 async function walkFiles(rootDir) {
+  let rootReal;
+  try {
+    rootReal = await realpath(rootDir);
+  } catch (err) {
+    throw wrapFsError(err, '解析产物目录');
+  }
+
   const found = [];
-  async function walk(dir) {
+
+  function symlinkError(reason, full) {
+    const relPath = toPosix(relative(rootReal, full));
+    const detail = relPath && !relPath.startsWith('..') && !isAbsolute(relPath) ? relPath : full;
+    const message =
+      reason === 'cycle'
+        ? `符号链接形成回路: ${detail}`
+        : `符号链接目标越出产物根目录: ${detail}`;
+    return new ProvError(ERROR_CODES.SYMLINK_INVALID, message, {
+      path: detail,
+      reason,
+    });
+  }
+
+  // dirStack 为当前递归链上已展开目录的真实路径（含真实目录与经链接展开的
+  // 目录），用于识别“指回祖先目录”的非 ELOOP 回路（如 sub/link -> ..）。
+  // 菱形共享（先前已遍历完、但非当前祖先的目录）不属于回路，允许按各自
+  // 链接路径重复展开。
+  async function walk(dirPath, dirReal, dirStack) {
     let entries;
     try {
-      entries = await readdir(dir, { withFileTypes: true });
+      entries = await readdir(dirPath, { withFileTypes: true });
     } catch (err) {
       throw wrapFsError(err, '读取产物目录');
     }
     for (const entry of entries) {
-      const full = join(dir, entry.name);
+      const full = join(dirPath, entry.name);
       if (entry.isDirectory()) {
-        await walk(full);
+        // dirReal 是当前目录的真实路径，其真实子条目的真实路径可直接拼接，
+        // 无需额外 realpath 系统调用。
+        await walk(full, join(dirReal, entry.name), [...dirStack, join(dirReal, entry.name)]);
       } else if (entry.isFile()) {
         found.push(full);
       } else if (entry.isSymbolicLink()) {
-        // 解引用后按目标类型处理：指向目录则继续递归，指向文件则记录。
+        // 先完整解析链接目标，再决定处理方式；绝不直接读取链接外部内容。
+        let targetReal;
+        try {
+          targetReal = await realpath(full);
+        } catch (err) {
+          if (err && err.code === 'ELOOP') throw symlinkError('cycle', full);
+          // 悬空链接等解析失败沿用既有归类（ENOENT -> INPUT_NOT_FOUND 等），
+          // 不冒充 SYMLINK_INVALID：只有回路或根目录外链接才产生该错误。
+          throw wrapFsError(err, '读取符号链接');
+        }
+        if (!isWithin(targetReal, rootReal)) {
+          throw symlinkError('outside-root', full);
+        }
         let target;
         try {
-          target = await stat(full);
+          target = await stat(targetReal);
         } catch (err) {
           throw wrapFsError(err, '读取符号链接');
         }
-        if (target.isDirectory()) await walk(full);
-        else if (target.isFile()) found.push(full);
+        if (target.isDirectory()) {
+          if (dirStack.includes(targetReal)) throw symlinkError('cycle', full);
+          // 仍以链接路径（full）递归，使其内容按链接相对路径记录。
+          await walk(full, targetReal, [...dirStack, targetReal]);
+        } else if (target.isFile()) {
+          found.push(full);
+        }
+        // 链接目标为其他特殊文件（套接字/设备等）忽略，与既有行为一致。
       }
       // 其他特殊文件（套接字/设备等）忽略。
     }
   }
-  await walk(rootDir);
+  await walk(rootReal, rootReal, [rootReal]);
   return found;
 }
 
@@ -176,12 +228,38 @@ export async function buildSbom(artifactPath, excludeDir) {
     throw wrapFsError(err, '读取产物');
   }
 
-  const rootDir = artifactStat.isDirectory() ? artifactAbs : dirname(artifactAbs);
-  const excludeAbs = excludeDir ? resolve(excludeDir) : null;
+  // 目录产物以真实路径为扫描与相对路径基准：walkFiles 内部同样按真实路径
+  // 解析符号链接，基准一致才能得到稳定的根内相对路径。
+  const isDirArtifact = artifactStat.isDirectory();
+  let rootDir;
+  if (isDirArtifact) {
+    try {
+      rootDir = await realpath(artifactAbs);
+    } catch (err) {
+      throw wrapFsError(err, '解析产物目录');
+    }
+  } else {
+    rootDir = dirname(artifactAbs);
+  }
+  // 排除目录的路径形式须与 files 中的路径一致才可比较：目录扫描返回真实
+  // 路径，故归一化为真实路径；单文件分支沿用逻辑路径（resolve），保持
+  // 既有自排除行为，不引入对 /tmp 等符号链接路径的额外依赖。
+  let excludeAbs = null;
+  if (excludeDir) {
+    if (isDirArtifact) {
+      try {
+        excludeAbs = await realpath(resolve(excludeDir));
+      } catch (err) {
+        throw wrapFsError(err, '解析输出目录');
+      }
+    } else {
+      excludeAbs = resolve(excludeDir);
+    }
+  }
 
   let files;
-  if (artifactStat.isDirectory()) {
-    files = await walkFiles(artifactAbs);
+  if (isDirArtifact) {
+    files = await walkFiles(rootDir);
   } else {
     files = [artifactAbs];
   }

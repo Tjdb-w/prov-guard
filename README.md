@@ -29,6 +29,23 @@
 - 时间字段（`generatedAt`）只写入证明，不参与产物摘要或任何文件摘要。
 - 空目录自然产生空文件列表；零字节文件按真实文件记录。
 
+## 目录产物与符号链接
+
+递归扫描目录产物时，对符号链接做安全处理（generate 与 verify 使用同一套规则）：
+
+- 链接指向产物根目录**内部**的普通文件或目录时，按**链接路径**记录目标内容；
+  目录链接指向的目录继续递归，其内容按链接相对路径记录。指向同一内部目录的
+  多个链接（菱形共享）允许重复展开，不属于回路。
+- 链接形成**回路**时（如链接指向自身、两个链接互指、子目录内链接指回任一祖先
+  目录），立即失败，不继续递归，返回 `SYMLINK_INVALID` / `cycle`。
+- 链接目标经完整解析后**越出产物根目录**时（相对或绝对路径指向根外），立即失败，
+  不读取任何外部内容，返回 `SYMLINK_INVALID` / `outside-root`。
+- 悬空链接（目标不存在）沿用既有行为，报 `INPUT_NOT_FOUND`，不产生 `SYMLINK_INVALID`。
+
+命中危险链接时不返回部分清单：generate 在写出任何证明之前失败，verify 在签名
+校验通过后的扫描阶段失败。错误的 `details` 至少包含相对 `path` 与 `reason`
+（`reason` 仅取 `cycle` 或 `outside-root`）。
+
 ## 运行环境
 
 - Node.js >= 18（使用内置 `node:crypto` 的 Ed25519，无需安装依赖）。
@@ -177,6 +194,7 @@ node provguard.mjs verify \
 | `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增/删除/重命名，或 `sbom.json` 与证明记录的 `sbomDigest` 不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch`） |
 | `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter` |
 | `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小排序列出全部违规，每项含 `rule` 与 `observed` |
+| `SYMLINK_INVALID` | 目录扫描中符号链接形成回路（`reason: "cycle"`）或目标越出产物根目录（`reason: "outside-root"`）；`details` 含相对 `path` 与 `reason`。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败；不递归、不读取链接外部内容、不返回部分清单。悬空链接仍报 `INPUT_NOT_FOUND` |
 | `USAGE_ERROR` | 缺少必填参数、未知子命令，或 `--sbom` 与 `--sbom-signature` 只给一者 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
@@ -204,4 +222,9 @@ node --test
 测试以子进程驱动 CLI，覆盖正常往返、确定性、空目录与零字节文件、输出目录自排除，
 以及字节篡改、新增/删除、错误公钥、非法签名、非法证明、缺失路径与私钥不可解析等错误路径；
 策略测试覆盖通过（PASS）、闭区间边界、指纹大小写不敏感、`requireSbom`、上限边界、
-违规排序、`generated-at-invalid`、策略文件各类非法情形、缺失/不可读以及篡改优先。
+违规排序、`generated-at-invalid`、策略文件各类非法情形、缺失/不可读以及篡改优先；
+符号链接测试覆盖根内文件/目录链接按链接路径记录、菱形共享不重复展开、确定性，
+以及根外文件/目录链接（相对与绝对）、自回路、互指回路、指回祖先目录的
+`SYMLINK_INVALID`，并验证该错误在 verify 中处于签名之后、完整性比对之前，
+且与错误公钥（`KEY_NOT_FOUND`）、字节篡改（仍为 `SYMLINK_INVALID`）、悬空链接
+（`INPUT_NOT_FOUND`）正确区分。

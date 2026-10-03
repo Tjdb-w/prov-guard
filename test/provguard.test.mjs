@@ -2,7 +2,7 @@
 // 运行：node --test
 import { spawnSync } from 'node:child_process';
 import { sign as cryptoSign, createPrivateKey } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -770,4 +770,274 @@ test('--policy 缺少路径 -> USAGE_ERROR', () => {
   ]);
   assert.equal(v.code, 1);
   assert.equal(v.stderr.errorCode, 'USAGE_ERROR');
+});
+
+// ---------------------------------------------------------------------------
+// 符号链接安全处理（SYMLINK_INVALID）
+// ---------------------------------------------------------------------------
+
+// 在临时根下建立一个干净的产物树，返回其路径。
+function makeLinkTree(name) {
+  const art = join(root, name);
+  mkdirSync(join(art, 'sub', 'deep'), { recursive: true });
+  mkdirSync(join(art, 'empty'));
+  writeFileSync(join(art, 'a.txt'), 'hello world\n');
+  writeFileSync(join(art, 'empty.bin'), Buffer.alloc(0));
+  writeFileSync(join(art, 'sub', 'b.txt'), 'nested\n');
+  writeFileSync(join(art, 'sub', 'deep', 'c.txt'), 'deep\n');
+  return art;
+}
+
+function assertSymlinkError(r, reason, relPath) {
+  assert.equal(r.code, 1);
+  assert.equal(r.stdout, null); // 不输出任何成功结果
+  assert.equal(r.stderr.status, 'ERROR');
+  assert.equal(r.stderr.errorCode, 'SYMLINK_INVALID');
+  assert.equal(r.stderr.details.reason, reason);
+  assert.ok(reason === 'cycle' || reason === 'outside-root');
+  assert.equal(r.stderr.details.path, relPath);
+}
+
+test('根内文件/目录符号链接安全：按链接路径记录目标内容，生成与验证一致', () => {
+  const k = keygen(join(root, 'lk-keys'));
+  const art = makeLinkTree('lk-safe');
+  // 文件链接（同目录、跨目录 ../）与目录链接均指向根内部。
+  symlinkSync('a.txt', join(art, 'link-a.txt'));
+  symlinkSync('../a.txt', join(art, 'sub', 'up-a.txt'));
+  symlinkSync('deep', join(art, 'sub', 'alias'));
+  const out = join(root, 'lk-safe-out');
+  const g = run(['generate', '--artifact', art, '--key', k.priv, '--out', out]);
+  assert.equal(g.code, 0, JSON.stringify(g.stderr));
+
+  const sbom = JSON.parse(readFileSync(join(out, 'sbom.json'), 'utf8'));
+  const byPath = new Map(sbom.files.map((f) => [f.path, f]));
+  // 链接条目按链接路径出现，摘要等于目标内容。
+  const aDigest = byPath.get('a.txt').sha256;
+  assert.equal(byPath.get('link-a.txt').sha256, aDigest);
+  assert.equal(byPath.get('sub/up-a.txt').sha256, aDigest);
+  // 目录链接内容按链接路径展开记录。
+  assert.equal(byPath.get('sub/alias/c.txt').sha256, byPath.get('sub/deep/c.txt').sha256);
+
+  const v = run([
+    'verify', '--artifact', art,
+    '--proof', join(out, 'proof.json'),
+    '--signature', join(out, 'proof.json.sig'),
+    '--key', k.pub,
+  ]);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.artifactDigest, g.stdout.artifactDigest);
+});
+
+test('根内链接产物确定性：多次生成的清单与产物摘要字节级一致', () => {
+  const k = keygen(join(root, 'lk-det-keys'));
+  const art = makeLinkTree('lk-det');
+  symlinkSync('a.txt', join(art, 'link-a.txt'));
+  symlinkSync('deep', join(art, 'sub', 'alias'));
+  const o1 = join(root, 'lk-det-o1');
+  const o2 = join(root, 'lk-det-o2');
+  generate(art, k.priv, o1);
+  generate(art, k.priv, o2);
+  const p1 = JSON.parse(readFileSync(join(o1, 'proof.json'), 'utf8'));
+  const p2 = JSON.parse(readFileSync(join(o2, 'proof.json'), 'utf8'));
+  assert.deepEqual(p1.files, p2.files);
+  assert.equal(p1.artifactDigest, p2.artifactDigest);
+});
+
+test('菱形目录共享（两个链接指向同一内部目录）不构成回路', () => {
+  const k = keygen(join(root, 'lk-dia-keys'));
+  const art = makeLinkTree('lk-dia');
+  symlinkSync('sub', join(art, 'l1'));
+  symlinkSync('sub', join(art, 'l2'));
+  const out = join(root, 'lk-dia-out');
+  const g = run(['generate', '--artifact', art, '--key', k.priv, '--out', out]);
+  assert.equal(g.code, 0, JSON.stringify(g.stderr));
+  const sbom = JSON.parse(readFileSync(join(out, 'sbom.json'), 'utf8'));
+  const pathsList = sbom.files.map((f) => f.path);
+  assert.ok(pathsList.includes('l1/b.txt'));
+  assert.ok(pathsList.includes('l2/b.txt'));
+});
+
+test('根外文件符号链接 -> generate 报 SYMLINK_INVALID/outside-root，且不写出任何证明', () => {
+  const k = keygen(join(root, 'lk-ext-keys'));
+  const art = makeLinkTree('lk-ext');
+  const out = join(root, 'lk-ext-out');
+  const outsideDir = join(root, 'outside');
+  mkdirSync(outsideDir);
+  writeFileSync(join(outsideDir, 'secret.txt'), 'SECRET\n');
+  symlinkSync('../outside/secret.txt', join(art, 'evil-file'));
+  const r = run(['generate', '--artifact', art, '--key', k.priv, '--out', out]);
+  assertSymlinkError(r, 'outside-root', 'evil-file');
+  // 输出目录即便被创建也必须为空：任何证明都不得落盘。
+  assert.deepEqual(existsSync(out) ? readdirSync(out) : [], []);
+});
+
+test('根外目录符号链接 -> SYMLINK_INVALID/outside-root（不递归、不读取外部内容）', () => {
+  const k = keygen(join(root, 'lk-extd-keys'));
+  const art = makeLinkTree('lk-extd');
+  const outsideDir = join(root, 'outside-d');
+  mkdirSync(join(outsideDir, 'nested'), { recursive: true });
+  writeFileSync(join(outsideDir, 'nested', 'secret.txt'), 'SECRET\n');
+  // 链接位于 sub/ 下，需要两级 .. 才能越出产物根。
+  symlinkSync('../../outside-d', join(art, 'sub', 'evil-dir'));
+  const out = join(root, 'lk-extd-out');
+  const r = run(['generate', '--artifact', art, '--key', k.priv, '--out', out]);
+  assertSymlinkError(r, 'outside-root', 'sub/evil-dir');
+  assert.deepEqual(existsSync(out) ? readdirSync(out) : [], []);
+});
+
+test('绝对路径指向根外 -> outside-root；绝对路径指向根内则安全', () => {
+  const k = keygen(join(root, 'lk-abs-keys'));
+  const outside = join(root, 'abs-outside');
+  mkdirSync(outside);
+  writeFileSync(join(outside, 'x.txt'), 'X');
+
+  const bad = makeLinkTree('lk-abs-bad');
+  symlinkSync(join(outside, 'x.txt'), join(bad, 'outlink'));
+  const r1 = run(['generate', '--artifact', bad, '--key', k.priv, '--out', join(root, 'lk-abs-bad-o')]);
+  assertSymlinkError(r1, 'outside-root', 'outlink');
+
+  const good = makeLinkTree('lk-abs-good');
+  symlinkSync(join(good, 'a.txt'), join(good, 'sub', 'abslink'));
+  const r2 = run(['generate', '--artifact', good, '--key', k.priv, '--out', join(root, 'lk-abs-good-o')]);
+  assert.equal(r2.code, 0, JSON.stringify(r2.stderr));
+});
+
+test('自引用符号链接 -> SYMLINK_INVALID/cycle', () => {
+  const k = keygen(join(root, 'lk-self-keys'));
+  const art = makeLinkTree('lk-self');
+  symlinkSync('loop', join(art, 'loop'));
+  const r = run(['generate', '--artifact', art, '--key', k.priv, '--out', join(root, 'lk-self-o')]);
+  assertSymlinkError(r, 'cycle', 'loop');
+});
+
+test('两个符号链接互指 -> SYMLINK_INVALID/cycle', () => {
+  const k = keygen(join(root, 'lk-mut-keys'));
+  const art = makeLinkTree('lk-mut');
+  symlinkSync('b', join(art, 'a'));
+  symlinkSync('a', join(art, 'b'));
+  const r = run(['generate', '--artifact', art, '--key', k.priv, '--out', join(root, 'lk-mut-o')]);
+  // readdir 顺序决定先命中 a 还是 b；两者均为回路入口，path 取先遍历到者。
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr.errorCode, 'SYMLINK_INVALID');
+  assert.equal(r.stderr.details.reason, 'cycle');
+  assert.ok(['a', 'b'].includes(r.stderr.details.path));
+});
+
+test('子目录内链接指回父目录或产物根 -> SYMLINK_INVALID/cycle', () => {
+  const k = keygen(join(root, 'lk-up-keys'));
+
+  const toParent = makeLinkTree('lk-up-parent');
+  symlinkSync('..', join(toParent, 'sub', 'up'));
+  const r1 = run(['generate', '--artifact', toParent, '--key', k.priv, '--out', join(root, 'lk-up-parent-o')]);
+  assertSymlinkError(r1, 'cycle', 'sub/up');
+
+  const toRoot = makeLinkTree('lk-up-root');
+  symlinkSync('../..', join(toRoot, 'sub', 'deep', 'toroot'));
+  const r2 = run(['generate', '--artifact', toRoot, '--key', k.priv, '--out', join(root, 'lk-up-root-o')]);
+  assertSymlinkError(r2, 'cycle', 'sub/deep/toroot');
+
+  const dotRoot = makeLinkTree('lk-up-dot');
+  symlinkSync('.', join(dotRoot, 'rootlink'));
+  const r3 = run(['generate', '--artifact', dotRoot, '--key', k.priv, '--out', join(root, 'lk-up-dot-o')]);
+  assertSymlinkError(r3, 'cycle', 'rootlink');
+});
+
+test('verify：签名有效但扫描时发现根外链接 -> SYMLINK_INVALID（区别于完整性差异）', () => {
+  const k = keygen(join(root, 'vk-ext-keys'));
+  const art = makeLinkTree('vk-ext');
+  const out = join(root, 'vk-ext-out');
+  generate(art, k.priv, out);
+  // 证明与签名对“无危险链接”的产物有效；随后植入根外链接再验证。
+  const outside = join(root, 'vk-outside');
+  mkdirSync(outside);
+  writeFileSync(join(outside, 'x.txt'), 'X');
+  symlinkSync('../vk-outside/x.txt', join(art, 'late'));
+  const v = run([
+    'verify', '--artifact', art,
+    '--proof', join(out, 'proof.json'),
+    '--signature', join(out, 'proof.json.sig'),
+    '--key', k.pub,
+  ]);
+  assertSymlinkError(v, 'outside-root', 'late');
+});
+
+test('verify：签名有效但扫描时发现回路 -> SYMLINK_INVALID/cycle', () => {
+  const k = keygen(join(root, 'vk-cyc-keys'));
+  const art = makeLinkTree('vk-cyc');
+  const out = join(root, 'vk-cyc-out');
+  generate(art, k.priv, out);
+  symlinkSync('loop', join(art, 'sub', 'loop'));
+  const v = run([
+    'verify', '--artifact', art,
+    '--proof', join(out, 'proof.json'),
+    '--signature', join(out, 'proof.json.sig'),
+    '--key', k.pub,
+  ]);
+  assertSymlinkError(v, 'cycle', 'sub/loop');
+});
+
+test('危险链接与错误公钥并存 -> KEY_NOT_FOUND（公钥/签名检查先于扫描）', () => {
+  const k = keygen(join(root, 'vk-precedence-keys'));
+  const k2 = keygen(join(root, 'vk-precedence-keys2'));
+  const art = makeLinkTree('vk-prec');
+  const out = join(root, 'vk-prec-out');
+  generate(art, k.priv, out);
+  symlinkSync('loop', join(art, 'loop'));
+  const v = run([
+    'verify', '--artifact', art,
+    '--proof', join(out, 'proof.json'),
+    '--signature', join(out, 'proof.json.sig'),
+    '--key', k2.pub,
+  ]);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'KEY_NOT_FOUND');
+});
+
+test('危险链接与字节篡改并存 -> SYMLINK_INVALID（扫描失败先于逐项完整性比对）', () => {
+  const k = keygen(join(root, 'vk-both-keys'));
+  const art = makeLinkTree('vk-both');
+  const out = join(root, 'vk-both-out');
+  generate(art, k.priv, out);
+  writeFileSync(join(art, 'a.txt'), 'CHANGED\n');
+  const outside = join(root, 'vk-both-outside');
+  mkdirSync(outside);
+  writeFileSync(join(outside, 'x.txt'), 'X');
+  symlinkSync('../vk-both-outside', join(art, 'evildir'));
+  const v = run([
+    'verify', '--artifact', art,
+    '--proof', join(out, 'proof.json'),
+    '--signature', join(out, 'proof.json.sig'),
+    '--key', k.pub,
+  ]);
+  assertSymlinkError(v, 'outside-root', 'evildir');
+});
+
+test('悬空符号链接 -> INPUT_NOT_FOUND（不产生 SYMLINK_INVALID）', () => {
+  const k = keygen(join(root, 'vk-dang-keys'));
+  const art = makeLinkTree('vk-dang');
+  symlinkSync('../does-not-exist', join(art, 'broken'));
+  const r = run(['generate', '--artifact', art, '--key', k.priv, '--out', join(root, 'vk-dang-o')]);
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr.errorCode, 'INPUT_NOT_FOUND');
+});
+
+test('启用 SBOM 与策略时，危险链接仍在签名有效后的扫描阶段报 SYMLINK_INVALID', () => {
+  const k = keygen(join(root, 'vk-sbom-keys'));
+  const art = makeLinkTree('vk-sbom');
+  const out = join(root, 'vk-sbom-out');
+  generate(art, k.priv, out);
+  const policy = join(root, 'vk-sbom-policy.json');
+  writeFileSync(policy, JSON.stringify({ policyVersion: '1.0' }));
+  symlinkSync('loop', join(art, 'loop'));
+  const v = run([
+    'verify', '--artifact', art,
+    '--proof', join(out, 'proof.json'),
+    '--signature', join(out, 'proof.json.sig'),
+    '--key', k.pub,
+    '--sbom', join(out, 'sbom.json'),
+    '--sbom-signature', join(out, 'sbom.json.sig'),
+    '--policy', policy,
+  ]);
+  assertSymlinkError(v, 'cycle', 'loop');
 });
