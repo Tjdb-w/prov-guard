@@ -4,10 +4,13 @@
 // 子命令：
 //   keygen   --key-dir <dir> [--name <prefix>]
 //   generate --artifact <path> --key <private-key> --out <dir> [--bundle]
+//   policy-sign --policy <policy.json> --key <private.pem> --signature <policy.json.sig>
 //   verify   --artifact <path> --proof <file> --signature <file> --key <public-key>
 //            [--sbom <file> --sbom-signature <file>] [--policy <policy.json>]
+//            [--policy-signature <policy.json.sig> --policy-key <public.pem>]
 //   verify   --artifact <path> --bundle <proof.bundle.json> --key <public-key>
 //            [--cosigner-key <public-key> ... --min-cosigners <n>] [--policy <policy.json>]
+//            [--policy-signature <policy.json.sig> --policy-key <public.pem>]
 //
 // 所有输出均为 UTF-8；成功结果写 stdout，错误结果写 stderr。
 
@@ -534,6 +537,67 @@ export async function generate({ artifact, key, out, coKeys = [], bundle = false
 }
 
 // ---------------------------------------------------------------------------
+// policy-sign：为既有策略文件生成独立的 Ed25519 签名。
+// 不改写策略、私钥或任何证明产物；签名覆盖 policy.json 的 UTF-8 稳定 JSON
+// 字节（键名排序、两空格缩进、末尾换行），Base64 加换行保存，重复生成逐字节一致。
+// 校验顺序：策略与私钥可读 -> 策略 JSON 合法（POLICY_INVALID）-> 私钥可解析且为
+// Ed25519（KEY_NOT_FOUND）-> 写签名（写失败 PERMISSION_DENIED）。
+// ---------------------------------------------------------------------------
+
+export async function policySign({ policy: policyPath, key: keyPath, signature: sigPath }) {
+  const policyAbs = resolve(policyPath);
+  const keyAbs = resolve(keyPath);
+  const sigAbs = resolve(sigPath);
+  // 输入检查：策略与私钥必须存在且可读。
+  for (const [p, label] of [
+    [policyAbs, '策略文件'],
+    [keyAbs, '私钥'],
+  ]) {
+    try {
+      await access(p, fsConstants.R_OK);
+    } catch (err) {
+      throw wrapFsError(err, `读取${label}`);
+    }
+  }
+
+  // 以磁盘字节为真解析并校验策略结构，再重算稳定 JSON 字节作为签名输入。
+  let policyText;
+  try {
+    policyText = await readFileUtf8(policyAbs);
+  } catch (err) {
+    throw wrapFsError(err, '读取策略文件');
+  }
+  let policy;
+  try {
+    policy = JSON.parse(policyText);
+  } catch {
+    throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略文件不是合法的 JSON');
+  }
+  // 复用既有严格校验：未知字段、取值与 policyVersion 非法均为 POLICY_INVALID。
+  const policyError = validatePolicyObject(policy);
+  if (policyError) {
+    throw new ProvError(ERROR_CODES.POLICY_INVALID, policyError);
+  }
+
+  const privateKey = readPrivateKey(keyAbs);
+  const signerFingerprint = keyFingerprint(createPublicKey(privateKey));
+
+  const canonicalBytes = Buffer.from(stableJsonStringify(policy) + '\n', 'utf8');
+  const signatureB64 = cryptoSign(null, canonicalBytes, privateKey).toString('base64') + '\n';
+  try {
+    await atomicWrite(sigAbs, signatureB64);
+  } catch (err) {
+    throw wrapFsError(err, '写入策略签名文件');
+  }
+
+  return {
+    policyPath: policyAbs,
+    signaturePath: sigAbs,
+    policySignerFingerprint: signerFingerprint,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 证明分发包（proof.bundle.json）：把一套证明产物打包为单个稳定 JSON 文件。
 // members 按逻辑名排序（stableJsonStringify 按键名排序），每项保存原文件字节的
 // Base64、SHA-256 与字节长度；原样保留文件字节（含签名输入的规范字节），
@@ -647,6 +711,8 @@ export async function verify({
   sbom: sbomPath,
   sbomSignature: sbomSigPath,
   policy: policyPath,
+  policySignature: policySigPath,
+  policyKey: policyKeyPath,
   cosignatures: cosigDir,
   cosignerKeys,
   minCosigners,
@@ -693,6 +759,18 @@ export async function verify({
     ? (Array.isArray(cosignerKeys) ? cosignerKeys : [cosignerKeys])
     : [];
 
+  // 策略签名：--policy-signature 与 --policy-key 必须同时给且必须与 --policy 同时给
+  // （缺一/无 --policy 由 CLI 层判为 USAGE_ERROR；库入口同样拒绝不完整参数）。
+  const policySignMode = policySigPath !== undefined || policyKeyPath !== undefined;
+  if (policySignMode && (policySigPath === undefined || policyKeyPath === undefined || policyPath === undefined)) {
+    throw new ProvError(
+      ERROR_CODES.USAGE_ERROR,
+      '--policy-signature 与 --policy-key 必须与 --policy 同时提供',
+    );
+  }
+  const policySigAbs = policySignMode ? resolve(policySigPath) : null;
+  const policyKeyAbs = policySignMode ? resolve(policyKeyPath) : null;
+
   // 1) 所有输入必须存在且可读。
   const inputs = [[artifactAbs, '产物']];
   if (bundleMode) {
@@ -704,6 +782,8 @@ export async function verify({
   if (!bundleMode && sbomMode) {
     inputs.push([sbomAbs, 'SBOM 文件'], [sbomSigAbs, 'SBOM 签名文件']);
   }
+  // 策略、策略签名与策略公钥在最后的策略阶段才读取（与既有“篡改优先于策略”一致），
+  // 不加入此处的早期输入检查。
   for (const [p, label] of inputs) {
     try {
       await access(p, fsConstants.R_OK);
@@ -873,11 +953,23 @@ export async function verify({
   }
 
   // 9) 可选策略：仅在签名、完整性、可选 SBOM、可选共签校验全部通过后加载并执行。
-  //    策略文件自身缺失/不可读/非法按其错误码返回（INPUT_NOT_FOUND /
-  //    PERMISSION_DENIED / POLICY_INVALID）；内容违规为 POLICY_VIOLATION。
+  //    启用策略签名时先验签再评估规则：
+  //      策略/签名/公钥缺失 -> INPUT_NOT_FOUND；不可读 -> PERMISSION_DENIED；
+  //      策略 JSON、未知字段、取值或 policyVersion 非法 -> POLICY_INVALID；
+  //      公钥无法解析或非 Ed25519 -> KEY_NOT_FOUND；
+  //      策略合法但签名 Base64、长度、内容或公钥不符 -> SIGNATURE_INVALID；
+  //      规则不满足 -> POLICY_VIOLATION。
   let policyStatus;
+  let policySignerFingerprint;
   if (policyPath !== undefined) {
     const policy = await loadPolicy(policyPath);
+    if (policySignMode) {
+      policySignerFingerprint = await verifyPolicySignature({
+        policy,
+        sigAbs: policySigAbs,
+        keyAbs: policyKeyAbs,
+      });
+    }
     const violations = evaluatePolicy(policy, proof, sbomMode);
     if (violations.length > 0) {
       throw new ProvError(
@@ -897,8 +989,70 @@ export async function verify({
   };
   if (sbomMode) result.sbomDigest = sbomDigest;
   if (cosignMode) result.cosignerCount = cosignerCount;
-  if (policyPath !== undefined) result.policyStatus = policyStatus;
+  if (policyPath !== undefined) {
+    result.policyStatus = policyStatus;
+    if (policySignMode) result.policySignerFingerprint = policySignerFingerprint;
+  }
   return result;
+}
+
+// 策略签名校验：在策略结构校验通过后调用。
+// 顺序：签名文件与公钥均须存在且可读（INPUT_NOT_FOUND / PERMISSION_DENIED）->
+// 公钥可解析且为 Ed25519（KEY_NOT_FOUND）-> 签名为合法 Base64 且 64 字节 ->
+// 对策略规范字节验签（内容、签名或公钥不符均为 SIGNATURE_INVALID）。
+// 返回策略签名公钥的指纹。
+async function verifyPolicySignature({ policy, sigAbs, keyAbs }) {
+  for (const [p, label] of [
+    [sigAbs, '策略签名文件'],
+    [keyAbs, '策略公钥'],
+  ]) {
+    try {
+      await access(p, fsConstants.R_OK);
+    } catch (err) {
+      throw wrapFsError(err, `读取${label}`);
+    }
+  }
+  const policyPublicKey = readPublicKey(keyAbs);
+  const fingerprint = keyFingerprint(policyPublicKey);
+
+  let sigText;
+  try {
+    sigText = await readFileUtf8(sigAbs);
+  } catch (err) {
+    throw wrapFsError(err, '读取策略签名文件');
+  }
+  const sigB64 = sigText.replace(/\s+/g, '');
+  let sigBuf;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
+    throw new ProvError(ERROR_CODES.SIGNATURE_INVALID, '策略签名文件不是合法的 Base64 内容');
+  }
+  try {
+    sigBuf = Buffer.from(sigB64, 'base64');
+  } catch {
+    throw new ProvError(ERROR_CODES.SIGNATURE_INVALID, '策略签名文件无法解码为字节');
+  }
+  if (sigBuf.length !== 64) {
+    throw new ProvError(
+      ERROR_CODES.SIGNATURE_INVALID,
+      `策略签名长度非法（Ed25519 应为 64 字节，实际 ${sigBuf.length} 字节）`,
+    );
+  }
+
+  // 签名输入与 policy-sign 完全一致：稳定 JSON（键名排序、两空格缩进）加末尾换行。
+  const canonicalBytes = Buffer.from(stableJsonStringify(policy) + '\n', 'utf8');
+  let sigOk = false;
+  try {
+    sigOk = cryptoVerify(null, canonicalBytes, policyPublicKey, sigBuf);
+  } catch {
+    sigOk = false;
+  }
+  if (!sigOk) {
+    throw new ProvError(
+      ERROR_CODES.SIGNATURE_INVALID,
+      '策略签名与策略内容不匹配（策略可能被改动，或签名/公钥不符）',
+    );
+  }
+  return fingerprint;
 }
 
 // SBOM 校验：结构 -> 摘要 -> 签名 -> 清单一致性。
@@ -1369,8 +1523,16 @@ async function loadPolicy(policyPath) {
   } catch {
     throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略文件不是合法的 JSON');
   }
+  const error = validatePolicyObject(policy);
+  if (error) throw new ProvError(ERROR_CODES.POLICY_INVALID, error);
+  return policy;
+}
+
+// 策略对象的严格结构校验：返回错误说明字符串，合法时返回 null。
+// 非对象、未知字段、非法类型或取值、policyVersion 非 "1.0"、时间区间倒置均为非法。
+function validatePolicyObject(policy) {
   if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
-    throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略顶层必须是 JSON 对象');
+    return '策略顶层必须是 JSON 对象';
   }
 
   const allowed = new Set([
@@ -1384,72 +1546,60 @@ async function loadPolicy(policyPath) {
   ]);
   for (const key of Object.keys(policy)) {
     if (!allowed.has(key)) {
-      throw new ProvError(ERROR_CODES.POLICY_INVALID, `策略包含未知字段: ${key}`);
+      return `策略包含未知字段: ${key}`;
     }
   }
 
   // policyVersion 必填，字符串且固定为 "1.0"。
   if (policy.policyVersion === undefined) {
-    throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略缺少必填字段: policyVersion');
+    return '策略缺少必填字段: policyVersion';
   }
   if (typeof policy.policyVersion !== 'string') {
-    throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略字段类型非法: policyVersion');
+    return '策略字段类型非法: policyVersion';
   }
   if (policy.policyVersion !== POLICY_VERSION) {
-    throw new ProvError(
-      ERROR_CODES.POLICY_INVALID,
-      `不支持的策略版本: ${policy.policyVersion}`,
-    );
+    return `不支持的策略版本: ${policy.policyVersion}`;
   }
 
   // 时间字段可选；出现时必须是合法 UTC ISO-8601 字符串。
   for (const k of ['proofNotBefore', 'proofNotAfter']) {
     if (policy[k] !== undefined && parseUtcIso(policy[k]) === null) {
-      throw new ProvError(ERROR_CODES.POLICY_INVALID, `策略字段取值非法: ${k}`);
+      return `策略字段取值非法: ${k}`;
     }
   }
 
   // 指纹白名单可选；缺省不约束，显式给出时必须为非空 SHA-256 十六进制数组。
   if (policy.allowedKeyFingerprints !== undefined) {
     if (!Array.isArray(policy.allowedKeyFingerprints)) {
-      throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略字段类型非法: allowedKeyFingerprints');
+      return '策略字段类型非法: allowedKeyFingerprints';
     }
     if (policy.allowedKeyFingerprints.length === 0) {
-      throw new ProvError(
-        ERROR_CODES.POLICY_INVALID,
-        '策略字段 allowedKeyFingerprints 不允许为空数组',
-      );
+      return '策略字段 allowedKeyFingerprints 不允许为空数组';
     }
     for (const fp of policy.allowedKeyFingerprints) {
       if (typeof fp !== 'string' || !/^[0-9a-f]{64}$/i.test(fp)) {
-        throw new ProvError(
-          ERROR_CODES.POLICY_INVALID,
-          '策略字段 allowedKeyFingerprints 中存在非法的 SHA-256 十六进制指纹',
-        );
+        return '策略字段 allowedKeyFingerprints 中存在非法的 SHA-256 十六进制指纹';
       }
     }
   }
 
   if (policy.requireSbom !== undefined && typeof policy.requireSbom !== 'boolean') {
-    throw new ProvError(ERROR_CODES.POLICY_INVALID, '策略字段类型非法: requireSbom');
+    return '策略字段类型非法: requireSbom';
   }
   for (const k of ['maxFileCount', 'maxSize']) {
     if (policy[k] !== undefined && !isNonNegSafeInt(policy[k])) {
-      throw new ProvError(ERROR_CODES.POLICY_INVALID, `策略字段取值非法: ${k}`);
+      return `策略字段取值非法: ${k}`;
     }
   }
 
   // 时间区间不得倒置；相等（闭区间单点）允许。
   if (policy.proofNotBefore !== undefined && policy.proofNotAfter !== undefined) {
     if (parseUtcIso(policy.proofNotBefore) > parseUtcIso(policy.proofNotAfter)) {
-      throw new ProvError(
-        ERROR_CODES.POLICY_INVALID,
-        '策略时间区间非法：proofNotBefore 晚于 proofNotAfter',
-      );
+      return '策略时间区间非法：proofNotBefore 晚于 proofNotAfter';
     }
   }
 
-  return policy;
+  return null;
 }
 
 // 在签名、完整性、可选 SBOM 校验全部通过后执行策略。
@@ -1536,20 +1686,25 @@ function usage() {
     '  provguard keygen   --key-dir <dir> [--name <prefix>]',
     '  provguard generate --artifact <path> --key <private.pem> --out <dir> \\',
     '                      [--co-key <private.pem> ...] [--bundle]',
+    '  provguard policy-sign --policy <policy.json> --key <private.pem> \\',
+    '                      --signature <policy.json.sig>',
     '  provguard verify   --artifact <path> --proof <proof.json> \\',
     '                      --signature <proof.json.sig> --key <public.pem> \\',
     '                      [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \\',
     '                      [--cosignatures <dir> --cosigner-key <public.pem> ... \\',
     '                       --min-cosigners <n>] \\',
-    '                      [--policy <policy.json>]',
+    '                      [--policy <policy.json>] \\',
+    '                      [--policy-signature <policy.json.sig> --policy-key <public.pem>]',
     '  provguard verify   --artifact <path> --bundle <proof.bundle.json> \\',
     '                      --key <public.pem> \\',
     '                      [--cosigner-key <public.pem> ... --min-cosigners <n>] \\',
-    '                      [--policy <policy.json>]',
+    '                      [--policy <policy.json>] \\',
+    '                      [--policy-signature <policy.json.sig> --policy-key <public.pem>]',
     '',
     'generate 输出: proof.json / proof.json.sig / sbom.json / sbom.json.sig',
     '启用共签时额外输出: proof.cosignatures.json / sbom.cosignatures.json',
     '使用 --bundle 时额外输出: proof.bundle.json（单文件证明分发包）',
+    'policy-sign 输出: policy.json.sig（策略的 Ed25519 签名，不改动策略与密钥）',
     '成功状态: VERIFIED；错误码见 README。',
   ].join('\n');
 }
@@ -1631,6 +1786,30 @@ async function main(argv) {
       return 0;
     }
 
+    if (command === 'policy-sign') {
+      const missing = ['policy', 'key', 'signature'].filter((k) => typeof args[k] !== 'string');
+      if (missing.length) {
+        throw new ProvError(
+          ERROR_CODES.USAGE_ERROR,
+          `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}`,
+        );
+      }
+      const r = await policySign({
+        policy: args.policy,
+        key: args.key,
+        signature: args.signature,
+      });
+      process.stdout.write(
+        `${stableJsonStringify({
+          status: 'POLICY_SIGNED',
+          policyPath: r.policyPath,
+          signaturePath: r.signaturePath,
+          policySignerFingerprint: r.policySignerFingerprint,
+        })}\n`,
+      );
+      return 0;
+    }
+
     if (command === 'verify') {
       // 包模式：--bundle 与独立文件入口（--proof/--signature/--sbom/
       // --sbom-signature/--cosignatures）互斥，混用为 USAGE_ERROR。
@@ -1661,6 +1840,25 @@ async function main(argv) {
       const hasPolicy = args.policy !== undefined;
       if (hasPolicy && typeof args.policy !== 'string') {
         throw new ProvError(ERROR_CODES.USAGE_ERROR, '--policy 需要提供策略文件路径');
+      }
+      // --policy-signature 与 --policy-key 必须成对出现，且必须与 --policy 同时提供；
+      // 缺值（后无路径）或只给一者均为 USAGE_ERROR。
+      const polSigRaw = args['policy-signature'];
+      const polKeyRaw = args['policy-key'];
+      const anyPolicySign = polSigRaw !== undefined || polKeyRaw !== undefined;
+      if (anyPolicySign || hasPolicy) {
+        if (anyPolicySign && !hasPolicy) {
+          throw new ProvError(
+            ERROR_CODES.USAGE_ERROR,
+            '--policy-signature 与 --policy-key 必须与 --policy 同时提供',
+          );
+        }
+      }
+      if (anyPolicySign && (typeof polSigRaw !== 'string' || typeof polKeyRaw !== 'string')) {
+        throw new ProvError(
+          ERROR_CODES.USAGE_ERROR,
+          '--policy-signature 与 --policy-key 必须同时提供且都需要文件路径',
+        );
       }
       // --sbom 与 --sbom-signature 必须成对出现（仅独立文件模式；包模式自带 SBOM 成员）。
       const hasSbom = typeof args.sbom === 'string';
@@ -1715,6 +1913,9 @@ async function main(argv) {
               sbomSignature: hasSbomSig ? args['sbom-signature'] : undefined,
             }),
         policy: hasPolicy ? args.policy : undefined,
+        ...(anyPolicySign
+          ? { policySignature: polSigRaw, policyKey: polKeyRaw }
+          : {}),
         ...cosignOpts,
       });
       process.stdout.write(`${stableJsonStringify(r)}\n`);
