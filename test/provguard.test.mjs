@@ -1698,3 +1698,361 @@ test('未启用策略签名时 verify 输出不含 policySignerFingerprint（行
   assert.equal(v2.stdout.policyStatus, 'PASS');
   assert.ok(!('policySignerFingerprint' in v2.stdout));
 });
+
+// ---------------------------------------------------------------------------
+// 策略 1.1：文件级发布准入（requiredFiles / forbiddenFiles）
+// ---------------------------------------------------------------------------
+
+const ZERO_DIGEST = '0'.repeat(64);
+
+function proofFileMap() {
+  return new Map(readProof().files.map((f) => [f.path, f]));
+}
+
+test('1.1 策略通过：requiredFiles 全部命中且摘要一致，forbiddenFiles 均不出现', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const files = proofFileMap();
+  const p = writePolicy({
+    policyVersion: '1.1',
+    requiredFiles: {
+      'a.txt': files.get('a.txt').sha256,
+      'sub/b.txt': files.get('sub/b.txt').sha256,
+      'sub/deep/c.bin': files.get('sub/deep/c.bin').sha256,
+      'empty.bin': files.get('empty.bin').sha256,
+    },
+    forbiddenFiles: ['not-there.txt', 'sub/missing.bin'],
+  }, 'policy-11-good.json');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+test('1.1 接受全部旧字段（时间窗口、指纹、SBOM、文件数、大小）并通过', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof();
+  const files = proofFileMap();
+  const p = writePolicy({
+    policyVersion: '1.1',
+    proofNotBefore: '2000-01-01T00:00:00Z',
+    proofNotAfter: '2099-01-01T00:00:00Z',
+    allowedKeyFingerprints: [proof.signerKeyFingerprint],
+    requireSbom: false,
+    maxFileCount: 4,
+    maxSize: proof.size,
+    requiredFiles: { 'a.txt': files.get('a.txt').sha256 },
+    forbiddenFiles: ['absent.txt'],
+  }, 'policy-11-all.json');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+test('requiredFiles 路径缺失 -> required-file-missing，observed 为路径', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const p = writePolicy({
+    policyVersion: '1.1',
+    requiredFiles: { 'does/not/exist.bin': ZERO_DIGEST },
+  }, 'policy-11-missing.json');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'required-file-missing', observed: 'does/not/exist.bin' },
+  ]);
+});
+
+test('requiredFiles 摘要不符 -> required-file-digest-mismatch，observed 为实际摘要（小写）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const actual = proofFileMap().get('a.txt').sha256;
+  const p = writePolicy({
+    policyVersion: '1.1',
+    requiredFiles: { 'a.txt': ZERO_DIGEST },
+  }, 'policy-11-digest.json');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'required-file-digest-mismatch', observed: actual },
+  ]);
+  assert.match(actual, /^[0-9a-f]{64}$/);
+});
+
+test('forbiddenFiles 路径出现 -> forbidden-file-present，observed 为路径', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const p = writePolicy({
+    policyVersion: '1.1',
+    forbiddenFiles: ['sub/deep/c.bin'],
+  }, 'policy-11-forbidden.json');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'forbidden-file-present', observed: 'sub/deep/c.bin' },
+  ]);
+});
+
+test('三类文件违规排序：先 missing 后 digest-mismatch 再 forbidden，同类按路径 UTF-16 码元升序', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const files = proofFileMap();
+  // 缺失路径中 z-* 字典序晚于 a-*，仍应排在所有 digest-mismatch 之前，
+  // 证明排序按“违规小类分组 + 组内路径”，而非跨小类的全局路径排序。
+  const p = writePolicy({
+    policyVersion: '1.1',
+    requiredFiles: {
+      'sub/b.txt': ZERO_DIGEST, // 存在但摘要不符
+      'a.txt': ZERO_DIGEST, // 存在但摘要不符（路径序早于 sub/b.txt）
+      'z-missing.txt': ZERO_DIGEST, // 缺失
+      'a-missing.txt': ZERO_DIGEST, // 缺失
+    },
+    forbiddenFiles: ['empty.bin'], // 存在
+  }, 'policy-11-order.json');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v.stderr.details.violations, [
+    { rule: 'required-file-missing', observed: 'a-missing.txt' },
+    { rule: 'required-file-missing', observed: 'z-missing.txt' },
+    { rule: 'required-file-digest-mismatch', observed: files.get('a.txt').sha256 },
+    { rule: 'required-file-digest-mismatch', observed: files.get('sub/b.txt').sha256 },
+    { rule: 'forbidden-file-present', observed: 'empty.bin' },
+  ]);
+});
+
+test('新规则排在时间、密钥、SBOM、文件数、大小规则之后', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const p = writePolicy({
+    policyVersion: '1.1',
+    proofNotBefore: '2099-01-01T00:00:00Z',
+    allowedKeyFingerprints: ['a'.repeat(64)],
+    requireSbom: true,
+    maxFileCount: 0,
+    maxSize: 0,
+    forbiddenFiles: ['a.txt'],
+  }, 'policy-11-after-legacy.json');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(
+    v.stderr.details.violations.map((x) => x.rule),
+    [
+      'proof-not-before',
+      'allowed-key-fingerprints',
+      'require-sbom',
+      'max-file-count',
+      'max-size',
+      'forbidden-file-present',
+    ],
+  );
+});
+
+test('路径按清单 Unicode 大小写精确匹配：A.TXT 不命中 a.txt', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const digestA = proofFileMap().get('a.txt').sha256;
+
+  // 仅大小写不同的禁止路径不构成违规。
+  const forbidUpper = writePolicy(
+    { policyVersion: '1.1', forbiddenFiles: ['A.TXT', 'Sub/b.txt'] },
+    'policy-11-case-forbid.json',
+  );
+  const v1 = verifyWithPolicy(k.pub, forbidUpper);
+  assert.equal(v1.code, 0, JSON.stringify(v1.stderr));
+  assert.equal(v1.stdout.policyStatus, 'PASS');
+
+  // 仅大小写不同的必需路径按缺失处理，而非匹配到 a.txt。
+  const requireUpper = writePolicy(
+    { policyVersion: '1.1', requiredFiles: { 'A.TXT': digestA } },
+    'policy-11-case-require.json',
+  );
+  const v2 = verifyWithPolicy(k.pub, requireUpper);
+  assert.equal(v2.code, 1);
+  assert.equal(v2.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v2.stderr.details.violations, [
+    { rule: 'required-file-missing', observed: 'A.TXT' },
+  ]);
+});
+
+test('1.1 策略非法 -> POLICY_INVALID（版本、类型、空值、摘要、路径、重复、重叠）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const d = proofFileMap().get('a.txt').sha256;
+  const cases = [
+    [JSON.stringify({ policyVersion: '1.0', requiredFiles: { 'a.txt': d } }), '1.0-required'],
+    [JSON.stringify({ policyVersion: '1.0', forbiddenFiles: ['a.txt'] }), '1.0-forbidden'],
+    [JSON.stringify({ policyVersion: '1.2', requiredFiles: { 'a.txt': d } }), 'bad-version'],
+    [JSON.stringify({ policyVersion: '1.1', unknown: 1 }), 'unknown-field'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: {} }), 'empty-required'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: [] }), 'empty-forbidden'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: [] }), 'required-array'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: 'x' }), 'required-string'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: null }), 'required-null'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: {} }), 'forbidden-object'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: 'x' }), 'forbidden-string'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: { 'a.txt': 123 } }), 'digest-number'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: { 'a.txt': 'XYZ' } }), 'digest-chars'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: { 'a.txt': 'a'.repeat(63) } }), 'digest-short'],
+    [JSON.stringify({ policyVersion: '1.1', requiredFiles: { 'a.txt': 'A'.repeat(64) } }), 'digest-uppercase'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['/a.txt'] }), 'absolute'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['a\\b.txt'] }), 'backslash'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['a//b'] }), 'empty-segment'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['a/'] }), 'trailing-slash'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['/'] }), 'root-slash'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['../a'] }), 'dotdot'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['a/./b'] }), 'dot-segment'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['.'] }), 'single-dot'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: [''] }), 'empty-path'],
+    [JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['a.txt', 'a.txt'] }), 'duplicate'],
+    [
+      JSON.stringify({
+        policyVersion: '1.1',
+        requiredFiles: { 'a.txt': d },
+        forbiddenFiles: ['a.txt'],
+      }),
+      'overlap',
+    ],
+  ];
+  for (const [content, name] of cases) {
+    const p = writePolicy(content, `policy-11-invalid-${name}.json`);
+    const v = verifyWithPolicy(k.pub, p);
+    assert.equal(v.code, 1, name);
+    assert.equal(v.stderr.errorCode, 'POLICY_INVALID', `${name}: ${JSON.stringify(v.stderr)}`);
+    assert.equal(v.stdout, null, name);
+  }
+});
+
+test('policy-sign 支持 1.1：签名往返成功、重复生成逐字节一致且不改写策略', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const d = proofFileMap().get('a.txt').sha256;
+  const p = writePolicy({
+    policyVersion: '1.1',
+    requiredFiles: { 'a.txt': d },
+    forbiddenFiles: ['evil.bin'],
+  }, 'policy-11-sign.json');
+  const before = readFileSync(p);
+
+  const s1 = join(root, 'p11-a.sig');
+  const s2 = join(root, 'p11-b.sig');
+  const r1 = policySign(k.priv, { policy: p, signature: s1 });
+  const r2 = policySign(k.priv, { policy: p, signature: s2 });
+  assert.equal(r1.code, 0, JSON.stringify(r1.stderr));
+  assert.equal(r1.stdout.status, 'POLICY_SIGNED');
+  assert.equal(r2.code, 0);
+  assert.deepEqual(readFileSync(s1), readFileSync(s2)); // 逐字节确定
+  assert.deepEqual(readFileSync(p), before); // 不改写策略
+
+  const v = verifyWithPolicySig(k.pub, p, s1, k.pub);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.policyStatus, 'PASS');
+  assert.match(v.stdout.policySignerFingerprint, /^[0-9a-f]{64}$/);
+});
+
+test('policy-sign 直接拒绝非法 1.1 策略（重叠/绝对路径/大写摘要）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const d = proofFileMap().get('a.txt').sha256;
+  const badCases = [
+    { policyVersion: '1.1', requiredFiles: { 'a.txt': d }, forbiddenFiles: ['a.txt'] },
+    { policyVersion: '1.1', forbiddenFiles: ['/etc/passwd'] },
+    { policyVersion: '1.1', requiredFiles: { 'a.txt': 'A'.repeat(64) } },
+  ];
+  badCases.forEach((obj, i) => {
+    const p = writePolicy(obj, `policy-11-badsign-${i}.json`);
+    const r = policySign(k.priv, { policy: p, signature: join(root, `p11-bad-${i}.sig`) });
+    assert.equal(r.code, 1, `case ${i}`);
+    assert.equal(r.stderr.errorCode, 'POLICY_INVALID', `case ${i}`);
+  });
+});
+
+test('签名后的 1.1 策略被篡改 -> SIGNATURE_INVALID（先于文件规则评估）', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const d = proofFileMap().get('a.txt').sha256;
+  const p = writePolicy({ policyVersion: '1.1', requiredFiles: { 'a.txt': d } }, 'policy-11-tamper.json');
+  policySign(k.priv, { policy: p, signature: join(root, 'p11-tamper.sig') });
+  // 改成必然违规的取值，但签名仍对应旧内容 -> SIGNATURE_INVALID 而非 VIOLATION。
+  writeFileSync(p, JSON.stringify({ policyVersion: '1.1', forbiddenFiles: ['a.txt'] }));
+  const v = verifyWithPolicySig(k.pub, p, join(root, 'p11-tamper.sig'), k.pub);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('产物篡改优先于 1.1 文件规则 -> INTEGRITY_MISMATCH', () => {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const d = proofFileMap().get('a.txt').sha256;
+  const p = writePolicy({ policyVersion: '1.1', requiredFiles: { 'a.txt': d } }, 'policy-11-tamper-art.json');
+  // 修改 a.txt：完整性阶段先失败，即使其摘要也必然不再匹配 requiredFiles。
+  writeFileSync(join(paths.art, 'a.txt'), 'CHANGED\n');
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
+  assert.ok(v.stderr.details.mismatches.some((m) => m.path === 'a.txt' && m.kind === 'content-modified'));
+});
+
+test('错误公钥 / 危险符号链接在 1.1 策略下仍返回原有错误码', () => {
+  const k = keygen(paths.keys);
+  const k2 = keygen(paths.keys2);
+  generate(paths.art, k.priv, paths.out);
+  const d = proofFileMap().get('a.txt').sha256;
+  const p = writePolicy({ policyVersion: '1.1', requiredFiles: { 'a.txt': d } }, 'policy-11-prio.json');
+
+  // 错误公钥 -> KEY_NOT_FOUND。
+  assert.equal(verifyWithPolicy(k2.pub, p).stderr.errorCode, 'KEY_NOT_FOUND');
+
+  // 越界符号链接 -> SYMLINK_INVALID（签名有效后的扫描阶段先于策略）。
+  writeFileSync(join(root, 'secret.txt'), 'top secret');
+  symlinkSync(join(root, 'secret.txt'), join(paths.art, 'leak.txt'));
+  const v = verifyWithPolicy(k.pub, p);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SYMLINK_INVALID');
+  assert.equal(v.stderr.details.reason, 'outside-root');
+});
+
+test('bundle 模式：1.1 策略往返（PASS）与禁止文件违规', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  const d = proofFileMap().get('a.txt').sha256;
+
+  const good = writePolicy(
+    { policyVersion: '1.1', requiredFiles: { 'a.txt': d }, forbiddenFiles: ['absent.bin'] },
+    'policy-11-bundle-good.json',
+  );
+  const v1 = verifyBundle(paths.art, g.bundlePath, k.pub, ['--policy', good]);
+  assert.equal(v1.code, 0, JSON.stringify(v1.stderr));
+  assert.equal(v1.stdout.policyStatus, 'PASS');
+
+  const bad = writePolicy(
+    { policyVersion: '1.1', forbiddenFiles: ['sub/b.txt'] },
+    'policy-11-bundle-bad.json',
+  );
+  const v2 = verifyBundle(paths.art, g.bundlePath, k.pub, ['--policy', bad]);
+  assert.equal(v2.code, 1);
+  assert.equal(v2.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v2.stderr.details.violations, [
+    { rule: 'forbidden-file-present', observed: 'sub/b.txt' },
+  ]);
+});
+
+test('共签 + 1.1 策略：全部通过时同时输出 cosignerCount 与 policyStatus', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  const d = proofFileMap().get('a.txt').sha256;
+  const p = writePolicy(
+    { policyVersion: '1.1', requiredFiles: { 'a.txt': d, 'sub/b.txt': proofFileMap().get('sub/b.txt').sha256 } },
+    'policy-11-cosign.json',
+  );
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 1, { policy: p });
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.cosignerCount, 1);
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
