@@ -885,3 +885,231 @@ test('两个链接指向同一内部目录（非回路）：均按链接路径�
   const v = verify(paths.art, paths.out, k.pub);
   assert.equal(v.stdout.status, 'VERIFIED');
 });
+
+// ---------------------------------------------------------------------------
+// 多方共签（generate --co-key；verify --cosignatures/--cosigner-key/--min-cosigners）
+// ---------------------------------------------------------------------------
+
+function generateWithCoKeys(artifact, mainPriv, out, coPrivs) {
+  const args = ['generate', '--artifact', artifact, '--key', mainPriv, '--out', out];
+  for (const p of coPrivs) args.push('--co-key', p);
+  const r = run(args);
+  assert.equal(r.code, 0, JSON.stringify(r.stderr));
+  return r.stdout;
+}
+
+function verifyWithCosign(artifact, out, pub, coPubs, min, overrides = {}) {
+  const args = [
+    'verify',
+    '--artifact', overrides.artifact ?? artifact,
+    '--proof', overrides.proof ?? join(out, 'proof.json'),
+    '--signature', overrides.signature ?? join(out, 'proof.json.sig'),
+    '--key', overrides.key ?? pub,
+  ];
+  if (!overrides.skipCosignatures) args.push('--cosignatures', overrides.cosignatures ?? out);
+  for (const p of coPubs) args.push('--cosigner-key', p);
+  if (min !== undefined) args.push('--min-cosigners', String(min));
+  if (overrides.policy) args.push('--policy', overrides.policy);
+  return run(args);
+}
+
+function setupCosign() {
+  const main = keygen(paths.keys);
+  const co1 = keygen(join(root, 'co1'));
+  const co2 = keygen(join(root, 'co2'));
+  return { main, co1, co2 };
+}
+
+test('共签往返：proofVersion 1.1、声明升序、双清单结构合法、验证输出 cosignerCount', () => {
+  const { main, co1, co2 } = setupCosign();
+  const g = generateWithCoKeys(paths.art, main.priv, paths.out, [co2.priv, co1.priv]);
+  assert.equal(g.status, 'GENERATED');
+  assert.equal(g.proofVersion, '1.1');
+  assert.equal(g.cosignerCount, 2);
+
+  const proof = JSON.parse(readFileSync(join(paths.out, 'proof.json'), 'utf8'));
+  assert.equal(proof.proofVersion, '1.1');
+  assert.ok(Array.isArray(proof.cosignerKeyFingerprints));
+  assert.equal(proof.cosignerKeyFingerprints.length, 2);
+  const sorted = [...proof.cosignerKeyFingerprints].sort();
+  assert.deepEqual(proof.cosignerKeyFingerprints, sorted); // 按指纹升序
+  assert.ok(!proof.cosignerKeyFingerprints.includes(proof.signerKeyFingerprint));
+
+  for (const name of ['proof.cosignatures.json', 'sbom.cosignatures.json']) {
+    const m = JSON.parse(readFileSync(join(paths.out, name), 'utf8'));
+    assert.equal(m.schemaVersion, '1.0');
+    assert.equal(m.artifactDigest, g.artifactDigest);
+    assert.equal(m.sbomDigest, proof.sbomDigest);
+    assert.deepEqual(
+      m.signers.map((s) => s.keyFingerprint),
+      proof.cosignerKeyFingerprints,
+    ); // 集合与证明声明一致且升序
+    for (const s of m.signers) assert.match(s.signature, /^[A-Za-z0-9+/]+={0,2}$/);
+  }
+
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub, co2.pub], 2);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.proofVersion, '1.1');
+  assert.equal(v.stdout.cosignerCount, 2);
+});
+
+test('缺省不变：无 --co-key 时不创建共签清单，proofVersion 仍为 1.0', () => {
+  const k = keygen(paths.keys);
+  const g = generate(paths.art, k.priv, paths.out);
+  assert.equal(g.proofVersion, '1.0');
+  assert.equal(g.cosignerCount, undefined);
+  const proof = JSON.parse(readFileSync(join(paths.out, 'proof.json'), 'utf8'));
+  assert.equal(proof.cosignerKeyFingerprints, undefined);
+  assert.ok(!existsSync(join(paths.out, 'proof.cosignatures.json')));
+  assert.ok(!existsSync(join(paths.out, 'sbom.cosignatures.json')));
+  const v = verify(paths.art, paths.out, k.pub);
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.cosignerCount, undefined);
+});
+
+test('1.1 证明不带共签参数仍可按原路径验证（无 cosignerCount）', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  const v = verify(paths.art, paths.out, main.pub);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.proofVersion, '1.1');
+  assert.equal(v.stdout.cosignerCount, undefined);
+});
+
+test('重复 --co-key -> USAGE_ERROR', () => {
+  const { main, co1 } = setupCosign();
+  const r = run([
+    'generate', '--artifact', paths.art, '--key', main.priv, '--out', paths.out,
+    '--co-key', co1.priv, '--co-key', co1.priv,
+  ]);
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr.errorCode, 'USAGE_ERROR');
+});
+
+test('--co-key 与主密钥相同 -> USAGE_ERROR', () => {
+  const { main } = setupCosign();
+  const r = run([
+    'generate', '--artifact', paths.art, '--key', main.priv, '--out', paths.out,
+    '--co-key', main.priv,
+  ]);
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr.errorCode, 'USAGE_ERROR');
+});
+
+test('共签三参数缺一 -> USAGE_ERROR', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  // 缺 --min-cosigners
+  let v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], undefined);
+  assert.equal(v.stderr.errorCode, 'USAGE_ERROR');
+  // 缺 --cosignatures
+  v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 1, { skipCosignatures: true });
+  assert.equal(v.stderr.errorCode, 'USAGE_ERROR');
+  // 缺 --cosigner-key
+  v = run([
+    'verify', '--artifact', paths.art,
+    '--proof', join(paths.out, 'proof.json'),
+    '--signature', join(paths.out, 'proof.json.sig'),
+    '--key', main.pub,
+    '--cosignatures', paths.out, '--min-cosigners', '1',
+  ]);
+  assert.equal(v.stderr.errorCode, 'USAGE_ERROR');
+});
+
+test('--min-cosigners 非正整数或超过公钥数 -> USAGE_ERROR', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  for (const bad of ['0', '-1', '1.5', 'abc']) {
+    const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], bad);
+    assert.equal(v.stderr.errorCode, 'USAGE_ERROR', `min=${bad}`);
+  }
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 2); // 只有 1 个公钥
+  assert.equal(v.stderr.errorCode, 'USAGE_ERROR');
+});
+
+test('共签清单缺失 -> INPUT_NOT_FOUND', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  const emptyDir = join(root, 'empty-cosig');
+  mkdirSync(emptyDir);
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 1, { cosignatures: emptyDir });
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'INPUT_NOT_FOUND');
+});
+
+test('未声明的共签公钥 -> KEY_NOT_FOUND', () => {
+  const { main, co1, co2 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co2.pub], 1); // co2 未声明
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'KEY_NOT_FOUND');
+});
+
+test('共签签名被篡改 -> SIGNATURE_INVALID', () => {
+  const { main, co1, co2 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv, co2.priv]);
+  const manifestPath = join(paths.out, 'proof.cosignatures.json');
+  const m = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  [m.signers[0].signature, m.signers[1].signature] = [m.signers[1].signature, m.signers[0].signature];
+  writeFileSync(manifestPath, JSON.stringify(m, null, 2) + '\n');
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub, co2.pub], 2);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('有效共签数不足（重复公钥按指纹去重）-> SIGNATURE_INVALID', () => {
+  const { main, co1, co2 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv, co2.priv]);
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub, co1.pub], 2);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('产物被篡改时共签参数不改变优先级 -> INTEGRITY_MISMATCH', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  writeFileSync(join(paths.art, 'a.txt'), 'CHANGED\n');
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 1);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
+});
+
+test('共签清单包含主签名指纹 -> PROOF_INVALID', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  const proof = JSON.parse(readFileSync(join(paths.out, 'proof.json'), 'utf8'));
+  const manifestPath = join(paths.out, 'proof.cosignatures.json');
+  const m = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  m.signers.push({
+    keyFingerprint: proof.signerKeyFingerprint,
+    signature: m.signers[0].signature,
+  });
+  m.signers.sort((a, b) => (a.keyFingerprint < b.keyFingerprint ? -1 : 1)); // 保持升序，隔离变量
+  writeFileSync(manifestPath, JSON.stringify(m, null, 2) + '\n');
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 1);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('部分共签达到 min 即可通过：min=1 时 cosignerCount 为实际有效数', () => {
+  const { main, co1, co2 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv, co2.priv]);
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 1);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.cosignerCount, 1);
+});
+
+test('共签与策略组合：共签通过后才执行策略，全通过输出 cosignerCount 与 policyStatus', () => {
+  const { main, co1 } = setupCosign();
+  generateWithCoKeys(paths.art, main.priv, paths.out, [co1.priv]);
+  const policyPath = join(root, 'policy.json');
+  writeFileSync(policyPath, JSON.stringify({ policyVersion: '1.0', maxFileCount: 10 }));
+  const v = verifyWithCosign(paths.art, paths.out, main.pub, [co1.pub], 1, { policy: policyPath });
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.cosignerCount, 1);
+  assert.equal(v.stdout.policyStatus, 'PASS');
+});
