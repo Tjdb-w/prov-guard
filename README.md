@@ -18,6 +18,9 @@
 - 可选多方共签：`generate --co-key` 附加共签私钥（证明版本升为 1.1 并声明共签者指纹，
   额外输出 `proof.cosignatures.json` / `sbom.cosignatures.json`）；
   `verify --cosignatures/--cosigner-key/--min-cosigners` 校验共签并输出 `cosignerCount`；
+- 可选证明分发包：`generate --bundle` 在独立文件之外额外输出单个 `proof.bundle.json`
+  （UTF-8 稳定 JSON，按逻辑名收录证明、主签名、SBOM、SBOM 签名；启用共签时再收录两个共签清单），
+  `verify --bundle` 直接从该文件完成与独立文件模式相同顺序与字段的验证；
 - 目录扫描的符号链接安全处理：指向产物根目录内部文件/目录的链接按链接路径记录目标内容；
   形成回路或越出产物根目录的链接以 `SYMLINK_INVALID` 失败，不会继续递归或读取外部内容；
 - 机器可读的错误码与非零退出码。
@@ -61,7 +64,7 @@ node provguard.mjs keygen --key-dir <目录> [--name <前缀>]
 ### 2. 生成证明与物料清单
 
 ```
-node provguard.mjs generate --artifact <产物路径> --key <私钥.pem> --out <输出目录> [--co-key <共签私钥.pem> ...]
+node provguard.mjs generate --artifact <产物路径> --key <私钥.pem> --out <输出目录> [--co-key <共签私钥.pem> ...] [--bundle]
 ```
 
 - `--artifact`：单个文件或目录；目录会被递归扫描。
@@ -70,6 +73,8 @@ node provguard.mjs generate --artifact <产物路径> --key <私钥.pem> --out <
 - `--co-key`：可选、可重复的共签私钥 PEM。每个共签者对与主签名相同的证明规范字节签名，
   并另对 SBOM 规范字节签名。重复的 `--co-key` 或与主密钥相同返回 `USAGE_ERROR`。
   不提供 `--co-key` 时行为与之前完全一致，不创建共签清单（也不创建空清单）。
+- `--bundle`：可选布尔开关。启用后在照常写出下列独立文件之外，额外在输出目录生成
+  单个 `proof.bundle.json` 证明分发包；不使用该开关时输出、语义与错误码完全不变。
 
 输出目录内容：
 
@@ -92,18 +97,41 @@ node provguard.mjs generate --artifact <产物路径> --key <私钥.pem> --out <
 产物摘要是对“排序后的完整文件清单”做 SHA-256，因此任何字节变化、文件新增、删除或重命名都会改变摘要。
 同一产物在未改动时，跨多次生成的清单与产物摘要字节级一致（仅 `generatedAt` 变化，且不影响摘要）。
 
+#### 证明分发包 `proof.bundle.json`（`--bundle`）
+
+`--bundle` 把同一套证明产物作为一个 UTF-8 稳定 JSON 文件交付，独立文件入口保持不变。
+顶层为 `bundleVersion`（固定 `"1.0"`）与 `members`；`members` 是对象，其键（成员逻辑名）
+按字典序排列，固定收录四个基础成员，启用共签时再成对收录两个共签成员：
+
+| 逻辑名 | 对应原文件 |
+| --- | --- |
+| `proof` | `proof.json` |
+| `proof-signature` | `proof.json.sig` |
+| `sbom` | `sbom.json` |
+| `sbom-signature` | `sbom.json.sig` |
+| `proof-cosignatures` | `proof.cosignatures.json`（仅共签） |
+| `sbom-cosignatures` | `sbom.cosignatures.json`（仅共签） |
+
+每个成员保存三项：`payload`（原文件字节的 Base64，含尾换行等原始字节，因此保留原始签名
+输入字节）、`sha256`（这些字节的 SHA-256 十六进制摘要）、`size`（字节长度）。成员字段按
+`payload` / `sha256` / `size` 顺序稳定输出。重复生成时，除 `generatedAt`、`proof` 及其签名
+（共签时还包括 `proof-cosignatures`，因其签名输入为 proof 字节）外，成员顺序、字段顺序与
+编码保持稳定；`sbom`、`sbom-signature` 与 `sbom-cosignatures` 字节级一致。启用 `--bundle`
+时成功 JSON 额外包含 `bundlePath`。
+
 ### 3. 验证
 
 ```
 node provguard.mjs verify \
-  --artifact <产物路径> \
-  --proof <proof.json> \
-  --signature <proof.json.sig> \
-  --key <公钥.pem> \
+  --artifact <产物路径> --key <公钥.pem> \
+  (--proof <proof.json> --signature <proof.json.sig> | --bundle <proof.bundle.json>) \
   [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \
   [--cosignatures <目录> --cosigner-key <公钥.pem> ... --min-cosigners <n>] \
   [--policy <policy.json>]
 ```
+
+证明与主签名有两种等价的提供方式：独立文件（`--proof` 与 `--signature` 成对）或分发包
+（`--bundle`）。两种方式下仍必须提供 `--artifact` 与主签名公钥 `--key`。
 
 验证顺序：检查输入存在且可读 → 解析公钥 → 解析并校验证明结构 → 校验签名格式 →
 比对签名公钥指纹并验签 → 重新扫描产物并逐项（摘要、文件名、大小、清单条目）比对 →
@@ -124,6 +152,20 @@ node provguard.mjs verify \
 （未声明或错误公钥报 `KEY_NOT_FOUND`）且其对证明与 SBOM 的签名均有效
 （签名不匹配或有效数量不足 `min` 报 `SIGNATURE_INVALID`，数量按指纹去重）。
 全部通过后输出 `VERIFIED` 并增加 `cosignerCount`；之后才执行可选策略。
+
+分发包模式（`--bundle <proof.bundle.json>`）：`--bundle` 与 `--proof`、`--signature`、
+`--sbom`、`--sbom-signature`、`--cosignatures` 互斥，参数混用或缺少成对输入返回
+`USAGE_ERROR`。证明、主签名、SBOM 与其签名固定取自包内成员，因此包模式始终执行 SBOM 校验，
+成功结果始终包含 `sbomDigest`（等价于独立文件模式成对提供 `--sbom`/`--sbom-signature`）；
+验证顺序与成功字段与独立文件模式一致。仍可提供 `--cosigner-key`（可重复）与
+`--min-cosigners` 校验包内共签清单（二者必须成对；共签成员须与证明版本一致且成对出现），
+以及 `--policy`（包内 SBOM 恒在且已校验，`requireSbom` 视为满足）。
+
+包模式的错误归类：包 JSON 不可解析、`bundleVersion` 非 `"1.0"`、成员缺失或多余
+（含共签成员与证明版本不一致）、成员非对象、Base64 非法、`size` 不符或 `sha256`
+与内容不符均为 `PROOF_INVALID`；公钥错误为 `KEY_NOT_FOUND`；证明或 SBOM 签名不符为
+`SIGNATURE_INVALID`；产物差异为 `INTEGRITY_MISMATCH`；策略问题沿用 `POLICY_INVALID`
+与 `POLICY_VIOLATION`；包文件路径不存在为 `INPUT_NOT_FOUND`。
 
 成功时 stdout 输出（启用 SBOM 校验时额外包含 `sbomDigest`；启用共签校验时额外包含
 `cosignerCount`；提供 `--policy` 且通过时额外包含 `"policyStatus": "PASS"`）：
@@ -198,16 +240,16 @@ node provguard.mjs verify \
 
 | 错误码 | 触发条件 |
 | --- | --- |
-| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥、策略文件、共签清单（`proof.cosignatures.json` / `sbom.cosignatures.json`）路径不存在 |
+| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥、策略文件、共签清单（`proof.cosignatures.json` / `sbom.cosignatures.json`）、证明分发包（`proof.bundle.json`）路径不存在 |
 | `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足），包括策略文件与共签清单不可读 |
 | `KEY_NOT_FOUND` | 公钥/私钥无法解析、不是 Ed25519，验证时提供的公钥与证明记录的签名密钥不一致（错误公钥），或共签公钥未在证明声明的共签者集合中 |
-| `PROOF_INVALID` | 证明、SBOM 或共签清单的 JSON 不可解析、结构或摘要非法；签名文件不是合法 Base64 或长度非法；共签清单含主签名指纹、指纹重复、与证明声明的签名者集合不一致 |
+| `PROOF_INVALID` | 证明、SBOM 或共签清单的 JSON 不可解析、结构或摘要非法；签名文件不是合法 Base64 或长度非法；共签清单含主签名指纹、指纹重复、与证明声明的签名者集合不一致；或分发包 JSON 不可解析、`bundleVersion` 非 `"1.0"`、成员缺失/多余（共签成员须与证明版本一致且成对）、成员 Base64 非法、字节长度或 SHA-256 与内容不符 |
 | `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏）；共签签名与内容不匹配，或有效共签数量不足 `--min-cosigners` |
 | `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增/删除/重命名，或 `sbom.json`（或共签校验时复算的 SBOM）与证明记录的 `sbomDigest` 不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch`） |
 | `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter` |
 | `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小排序列出全部违规，每项含 `rule` 与 `observed` |
 | `SYMLINK_INVALID` | 目录扫描发现危险符号链接：形成回路（`details.reason` 为 `cycle`）或目标越出产物根目录（`details.reason` 为 `outside-root`）；`details.path` 为链接的相对路径。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败 |
-| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量 |
+| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量；`--bundle` 与 `--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures` 混用，或包模式下 `--cosigner-key` 与 `--min-cosigners` 未成对提供 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
 
@@ -225,6 +267,16 @@ node provguard.mjs verify   --artifact dist/ \
   --policy policy.json
 ```
 
+单文件分发包方式（生成与交付一个 `proof.bundle.json`）：
+
+```
+node provguard.mjs generate --artifact dist/ --key keys/provguard.private.pem \
+  --out attestation/ --bundle
+node provguard.mjs verify   --artifact dist/ \
+  --key keys/provguard.public.pem \
+  --bundle attestation/proof.bundle.json
+```
+
 ## 测试
 
 ```
@@ -239,4 +291,8 @@ node --test
 generate 失败前不写证明、verify 扫描阶段报错，以及安全内部链接的记录与稳定性；
 共签测试覆盖双清单往返与结构、缺省不创建清单、1.1 证明的旧路径验证、重复/同源
 `--co-key`、三参数缺一与非法 `min`、清单缺失、未声明公钥、签名篡改、有效数不足、
-产物篡改优先级、清单含主签名指纹、部分共签达标以及共签与策略组合。
+产物篡改优先级、清单含主签名指纹、部分共签达标以及共签与策略组合；
+分发包测试覆盖独立文件并存与 `bundlePath`、成员原文件字节/哈希/长度一致、共签成员、
+重复生成确定性、包模式往返（含输出目录自排除）、共签与策略组合、参数互斥与成对缺失、
+JSON/版本/成员集合/Base64/长度/SHA-256 非法、证明与 SBOM 签名失配、错误公钥、
+产物差异与包文件缺失等路径。

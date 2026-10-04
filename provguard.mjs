@@ -3,8 +3,8 @@
 //
 // 子命令：
 //   keygen   --key-dir <dir> [--name <prefix>]
-//   generate --artifact <path> --key <private-key> --out <dir>
-//   verify   --artifact <path> --proof <file> --signature <file> --key <public-key>
+//   generate --artifact <path> --key <private-key> --out <dir> [--bundle]
+//   verify   --artifact <path> (--proof <file> --signature <file> | --bundle <file>) --key <public-key>
 //            [--sbom <file> --sbom-signature <file>] [--policy <policy.json>]
 //
 // 所有输出均为 UTF-8；成功结果写 stdout，错误结果写 stderr。
@@ -26,6 +26,17 @@ export const PROOF_VERSION = '1.0';
 // 启用多方共签时证明版本升为 1.1；共签清单（proof/sbom.cosignatures.json）的 schemaVersion。
 export const PROOF_VERSION_COSIGN = '1.1';
 export const COSIGN_SCHEMA_VERSION = '1.0';
+// 证明分发包 proof.bundle.json 的格式版本。
+export const BUNDLE_VERSION = '1.0';
+// 分发包成员的逻辑名（固定集合，按此顺序排列）；共签启用时追加两个共签清单成员。
+export const BUNDLE_MEMBERS = Object.freeze([
+  'proof',
+  'proof-signature',
+  'sbom',
+  'sbom-signature',
+]);
+export const BUNDLE_COSIGN_MEMBERS = Object.freeze(['proof-cosignatures', 'sbom-cosignatures']);
+export const BUNDLE_FILE_NAME = 'proof.bundle.json';
 
 // ---------------------------------------------------------------------------
 // 错误类型：携带机器可读错误码，CLI 边界统一转换为非零退出。
@@ -356,7 +367,7 @@ export async function keygen({ keyDir, name = 'provguard' }) {
 // generate
 // ---------------------------------------------------------------------------
 
-export async function generate({ artifact, key, out, coKeys = [] }) {
+export async function generate({ artifact, key, out, coKeys = [], bundle = false }) {
   // 输入检查：产物与私钥必须存在且可读。
   const artifactAbs = resolve(artifact);
   const keyAbs = resolve(key);
@@ -464,6 +475,9 @@ export async function generate({ artifact, key, out, coKeys = [] }) {
   // 并另对 SBOM 规范字节签名（sbom.cosignatures.json）。不提供 --co-key 时不创建这些文件。
   const proofCosigPath = coSign ? join(outReal, 'proof.cosignatures.json') : null;
   const sbomCosigPath = coSign ? join(outReal, 'sbom.cosignatures.json') : null;
+  // 保留共签清单的写出字节，供可选分发包原样收录。
+  let proofCosigJson = null;
+  let sbomCosigJson = null;
   try {
     await atomicWrite(proofPath, proofJson);
     await atomicWrite(sbomPath, sbomJson);
@@ -481,11 +495,35 @@ export async function generate({ artifact, key, out, coKeys = [] }) {
           signature: cryptoSign(null, bytes, c.key).toString('base64'),
         })),
       });
-      await atomicWrite(proofCosigPath, stableJsonStringify(cosignManifest(proofBytes)) + '\n');
-      await atomicWrite(sbomCosigPath, stableJsonStringify(cosignManifest(sbomBytes)) + '\n');
+      proofCosigJson = stableJsonStringify(cosignManifest(proofBytes)) + '\n';
+      sbomCosigJson = stableJsonStringify(cosignManifest(sbomBytes)) + '\n';
+      await atomicWrite(proofCosigPath, proofCosigJson);
+      await atomicWrite(sbomCosigPath, sbomCosigJson);
     }
   } catch (err) {
     throw wrapFsError(err, '写入证明产物');
+  }
+
+  // 可选分发包：在独立文件之外额外把各产物原样（含尾换行等原始字节）打包为
+  // 单个 UTF-8 稳定 JSON。成员内容与磁盘文件字节逐一对应。
+  let bundlePath = null;
+  if (bundle) {
+    bundlePath = join(outReal, BUNDLE_FILE_NAME);
+    const memberBytes = new Map([
+      ['proof', Buffer.from(proofJson, 'utf8')],
+      ['proof-signature', Buffer.from(signatureB64, 'utf8')],
+      ['sbom', Buffer.from(sbomJson, 'utf8')],
+      ['sbom-signature', Buffer.from(sbomSignatureB64, 'utf8')],
+    ]);
+    if (coSign) {
+      memberBytes.set('proof-cosignatures', Buffer.from(proofCosigJson, 'utf8'));
+      memberBytes.set('sbom-cosignatures', Buffer.from(sbomCosigJson, 'utf8'));
+    }
+    try {
+      await atomicWrite(bundlePath, buildBundle(memberBytes));
+    } catch (err) {
+      throw wrapFsError(err, '写入证明分发包');
+    }
   }
 
   const result = {
@@ -498,6 +536,7 @@ export async function generate({ artifact, key, out, coKeys = [] }) {
     fileCount: sbom.files.length,
     proofVersion: proof.proofVersion,
   };
+  if (bundle) result.bundlePath = bundlePath;
   if (coSign) {
     result.cosignerCount = coSigners.length;
     result.proofCosignaturesPath = proofCosigPath;
@@ -520,6 +559,117 @@ async function atomicWrite(target, contents) {
 }
 
 // ---------------------------------------------------------------------------
+// 证明分发包（proof.bundle.json）
+// ---------------------------------------------------------------------------
+
+// 单个成员：原文件 Base64、SHA-256（十六进制）与字节长度。
+function bundleMember(bytes) {
+  return {
+    sha256: sha256Hex(bytes),
+    size: bytes.length,
+    payload: bytes.toString('base64'),
+  };
+}
+
+// 构建分发包：顶层 bundleVersion 与按逻辑名排序的 members。
+// memberBytes 为 逻辑名 -> 原始文件字节（Buffer）。稳定 JSON 加尾换行写出。
+function buildBundle(memberBytes) {
+  const names = [...memberBytes.keys()].sort();
+  const members = {};
+  for (const name of names) {
+    members[name] = bundleMember(memberBytes.get(name));
+  }
+  return stableJsonStringify({ bundleVersion: BUNDLE_VERSION, members }) + '\n';
+}
+
+// 严格 Base64 解码：非法字符/填充返回 null（Node 的 Buffer 会容忍非法输入，须自行拦截）。
+function decodeBase64Strict(b64) {
+  if (typeof b64 !== 'string' || b64.length === 0 || b64.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) return null;
+  // 等号只能出现在末尾，且最多两个。
+  const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  if (b64.indexOf('=') !== -1 && b64.indexOf('=') !== b64.length - pad) return null;
+  return Buffer.from(b64, 'base64');
+}
+
+// 读取并严格校验分发包信封，解码全部成员，返回 逻辑名 -> 原始字节。
+// 信封/JSON/版本/成员名/Base64/长度/摘要问题一律为 PROOF_INVALID；
+// 成员集合是否与证明版本匹配由调用方在解析证明后用 assertBundleMembers 复核。
+function readBundle(bundleText) {
+  let bundle;
+  try {
+    bundle = JSON.parse(bundleText);
+  } catch {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '分发包不是合法的 JSON');
+  }
+  if (bundle === null || typeof bundle !== 'object' || Array.isArray(bundle)) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '分发包顶层必须是 JSON 对象');
+  }
+  if (bundle.bundleVersion !== BUNDLE_VERSION) {
+    throw new ProvError(
+      ERROR_CODES.PROOF_INVALID,
+      `分发包 bundleVersion 缺失或不受支持（应为 ${BUNDLE_VERSION}）`,
+    );
+  }
+  if (bundle.members === null || typeof bundle.members !== 'object' || Array.isArray(bundle.members)) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '分发包 members 缺失或类型非法');
+  }
+
+  const knownNames = new Set([...BUNDLE_MEMBERS, ...BUNDLE_COSIGN_MEMBERS]);
+  const decoded = new Map();
+  for (const name of Object.keys(bundle.members)) {
+    if (!knownNames.has(name)) {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, `分发包成员名未知或多余: ${name}`);
+    }
+    const m = bundle.members[name];
+    if (m === null || typeof m !== 'object' || Array.isArray(m)) {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, `分发包成员不是 JSON 对象: ${name}`);
+    }
+    const bytes = decodeBase64Strict(m.payload);
+    if (bytes === null) {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, `分发包成员不是合法的 Base64 内容: ${name}`);
+    }
+    if (typeof m.size !== 'number' || !Number.isSafeInteger(m.size) || m.size < 0) {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, `分发包成员字节长度非法: ${name}`);
+    }
+    if (m.size !== bytes.length) {
+      throw new ProvError(
+        ERROR_CODES.PROOF_INVALID,
+        `分发包成员字节长度与 Base64 内容不符: ${name}`,
+        { name, expected: m.size, actual: bytes.length },
+      );
+    }
+    if (typeof m.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(m.sha256)) {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, `分发包成员 SHA-256 非法: ${name}`);
+    }
+    if (sha256Hex(bytes).toLowerCase() !== m.sha256.toLowerCase()) {
+      throw new ProvError(
+        ERROR_CODES.PROOF_INVALID,
+        `分发包成员 SHA-256 与 Base64 内容不符: ${name}`,
+      );
+    }
+    decoded.set(name, bytes);
+  }
+  return decoded;
+}
+
+// 成员集合必须恰好为四个基础成员；共签清单成对出现，且与证明版本一致
+// （proofVersion 1.1 必须携带，1.0 不得携带），否则 PROOF_INVALID。
+function assertBundleMembers(members, proof) {
+  for (const name of BUNDLE_MEMBERS) {
+    if (!members.has(name)) {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, `分发包缺少必需成员: ${name}`);
+    }
+  }
+  const expectCosign = proof.proofVersion === PROOF_VERSION_COSIGN;
+  const hasProofCosig = members.has('proof-cosignatures');
+  const hasSbomCosig = members.has('sbom-cosignatures');
+  if (hasProofCosig !== hasSbomCosig || hasProofCosig !== expectCosign) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '分发包共签成员缺失或多余（须与证明版本一致且成对出现）');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
 
@@ -534,24 +684,45 @@ export async function verify({
   cosignatures: cosigDir,
   cosignerKeys,
   minCosigners,
+  bundle: bundlePath,
 }) {
   const artifactAbs = resolve(artifact);
-  const proofAbs = resolve(proofPath);
-  const sigAbs = resolve(sigPath);
   const keyAbs = resolve(pubKeyPath);
+  const bundleMode = bundlePath !== undefined;
 
   // --sbom 与 --sbom-signature 必须成对出现；只给一者是用法错误。
   const sbomMode = sbomPath !== undefined || sbomSigPath !== undefined;
   if (sbomMode && (sbomPath === undefined || sbomSigPath === undefined)) {
     throw new ProvError(ERROR_CODES.USAGE_ERROR, '--sbom 与 --sbom-signature 必须成对提供');
   }
+  // 分发包模式下，SBOM 及其签名固定取自包内成员，不允许再提供独立文件。
+  if (bundleMode && sbomMode) {
+    throw new ProvError(
+      ERROR_CODES.USAGE_ERROR,
+      '--bundle 与 --sbom、--sbom-signature、--proof、--signature、--cosignatures 互斥',
+    );
+  }
   const sbomAbs = sbomMode ? resolve(sbomPath) : null;
   const sbomSigAbs = sbomMode ? resolve(sbomSigPath) : null;
 
   // 共签校验三参数必须同时提供：--cosignatures、--cosigner-key（可重复）、--min-cosigners。
+  // 分发包模式下没有 --cosignatures（清单在包内）：另两个参数仍需成对出现。
   const cosignMode =
     cosigDir !== undefined || cosignerKeys !== undefined || minCosigners !== undefined;
-  if (cosignMode && (cosigDir === undefined || cosignerKeys === undefined || minCosigners === undefined)) {
+  if (bundleMode) {
+    if (cosigDir !== undefined) {
+      throw new ProvError(
+        ERROR_CODES.USAGE_ERROR,
+        '--bundle 与 --cosignatures 互斥（包模式共签清单取自包内）',
+      );
+    }
+    if (cosignMode && (cosignerKeys === undefined || minCosigners === undefined)) {
+      throw new ProvError(
+        ERROR_CODES.USAGE_ERROR,
+        '包模式下 --cosigner-key 与 --min-cosigners 必须同时提供',
+      );
+    }
+  } else if (cosignMode && (cosigDir === undefined || cosignerKeys === undefined || minCosigners === undefined)) {
     throw new ProvError(
       ERROR_CODES.USAGE_ERROR,
       '--cosignatures、--cosigner-key 与 --min-cosigners 必须同时提供',
@@ -564,10 +735,16 @@ export async function verify({
   // 1) 所有输入必须存在且可读。
   const inputs = [
     [artifactAbs, '产物'],
-    [proofAbs, '证明文件'],
-    [sigAbs, '签名文件'],
     [keyAbs, '公钥'],
   ];
+  if (bundleMode) {
+    inputs.push([resolve(bundlePath), '证明分发包']);
+  } else {
+    inputs.push(
+      [resolve(proofPath), '证明文件'],
+      [resolve(sigPath), '签名文件'],
+    );
+  }
   if (sbomMode) {
     inputs.push([sbomAbs, 'SBOM 文件'], [sbomSigAbs, 'SBOM 签名文件']);
   }
@@ -582,16 +759,84 @@ export async function verify({
   // 2) 公钥必须可解析且为 Ed25519 —— 错误/不支持的公钥归 KEY_NOT_FOUND。
   const publicKey = readPublicKey(keyAbs);
 
-  // 3) 证明文件必须是可解析的 JSON 且结构合法 —— 否则 PROOF_INVALID。
-  let proofText;
-  try {
-    proofText = await readFileUtf8(proofAbs);
-  } catch (err) {
-    throw wrapFsError(err, '读取证明文件');
+  // 3) 取得证明、主签名、SBOM、共签清单的原始字节。
+  //    独立文件模式直接读盘；分发包模式解析信封并逐项校验 Base64/长度/SHA-256。
+  let proofBytes;
+  let sigBuf;
+  let sbomBytes = null;
+  let sbomSigBytes = null;
+  // 共签清单延迟到第 8 步（签名、完整性、SBOM 全部通过之后）才读取与解析，
+  // 与独立文件模式原有顺序保持一致；此处只暂存来源。
+  let proofCosignSource = null;
+  let sbomCosignSource = null;
+  let proofLocation; // 证明所在位置：文件路径或分发包路径（用于推断产物排除目录）。
+
+  if (bundleMode) {
+    const bundleAbs = resolve(bundlePath);
+    let bundleText;
+    try {
+      bundleText = await readFileUtf8(bundleAbs);
+    } catch (err) {
+      throw wrapFsError(err, '读取证明分发包');
+    }
+    const members = readBundle(bundleText);
+    proofBytes = members.get('proof');
+
+    // 证明先解析并做结构校验，再据此复核成员集合（共签成员须与证明版本一致）。
+    let proofPreview;
+    try {
+      proofPreview = JSON.parse(proofBytes.toString('utf8'));
+    } catch {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, '证明文件不是合法的 JSON');
+    }
+    const previewError = validateProof(proofPreview);
+    if (previewError) throw new ProvError(ERROR_CODES.PROOF_INVALID, previewError);
+    assertBundleMembers(members, proofPreview);
+
+    sigBuf = decodeSignatureBytes(members.get('proof-signature'), '签名文件');
+    sbomBytes = members.get('sbom');
+    sbomSigBytes = members.get('sbom-signature');
+    if (proofPreview.proofVersion === PROOF_VERSION_COSIGN) {
+      // 仅记下成员字节；结构与签名核校仍在第 8 步进行。
+      proofCosignSource = { kind: 'bytes', bytes: members.get('proof-cosignatures') };
+      sbomCosignSource = { kind: 'bytes', bytes: members.get('sbom-cosignatures') };
+    }
+    proofLocation = bundleAbs;
+  } else {
+    const proofAbs = resolve(proofPath);
+    const sigAbs = resolve(sigPath);
+    try {
+      proofBytes = await readFile(proofAbs);
+    } catch (err) {
+      throw wrapFsError(err, '读取证明文件');
+    }
+    let sigBytes;
+    try {
+      sigBytes = await readFile(sigAbs);
+    } catch (err) {
+      throw wrapFsError(err, '读取签名文件');
+    }
+    sigBuf = decodeSignatureBytes(sigBytes, '签名文件');
+    if (sbomMode) {
+      try {
+        [sbomBytes, sbomSigBytes] = await Promise.all([readFile(sbomAbs), readFile(sbomSigAbs)]);
+      } catch (err) {
+        throw wrapFsError(err, '读取 SBOM 文件');
+      }
+    }
+    if (cosignMode) {
+      // 仅记下清单路径；存在性检查与解析在第 8 步进行。
+      const dir = resolve(cosigDir);
+      proofCosignSource = { kind: 'file', path: join(dir, 'proof.cosignatures.json') };
+      sbomCosignSource = { kind: 'file', path: join(dir, 'sbom.cosignatures.json') };
+    }
+    proofLocation = proofAbs;
   }
+
+  // 4) 证明必须是可解析的 JSON 且结构合法 —— 否则 PROOF_INVALID。
   let proof;
   try {
-    proof = JSON.parse(proofText);
+    proof = JSON.parse(proofBytes.toString('utf8'));
   } catch {
     throw new ProvError(ERROR_CODES.PROOF_INVALID, '证明文件不是合法的 JSON');
   }
@@ -600,33 +845,14 @@ export async function verify({
     throw new ProvError(ERROR_CODES.PROOF_INVALID, proofError);
   }
 
-  // 4) 签名文件必须是合法 Base64 且长度符合 Ed25519（64 字节）—— 否则 PROOF_INVALID。
-  const sigText = await readFileUtf8(sigAbs);
-  const sigB64 = sigText.replace(/\s+/g, '');
-  let sigBuf;
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
-    throw new ProvError(ERROR_CODES.PROOF_INVALID, '签名文件不是合法的 Base64 内容');
-  }
-  try {
-    sigBuf = Buffer.from(sigB64, 'base64');
-  } catch {
-    throw new ProvError(ERROR_CODES.PROOF_INVALID, '签名文件无法解码为字节');
-  }
-  if (sigBuf.length !== 64) {
-    throw new ProvError(
-      ERROR_CODES.PROOF_INVALID,
-      `签名长度非法（Ed25519 应为 64 字节，实际 ${sigBuf.length} 字节）`,
-    );
-  }
-
   // 5) 重算证明的规范字节并验签。
-  //    以磁盘上的 proof.json 原样为真，重新序列化其解析结果用于验签；
+  //    以收录的 proof 原样字节为真，重新序列化其解析结果用于验签；
   //    generate 写出的即为稳定规范形式，因此往返一致。
   //
   //    错误归类（三者互不相同）：
   //      - 提供的公钥与证明中记录的签钥指纹不一致  -> KEY_NOT_FOUND（错误公钥）
   //      - 公钥一致但签名验证失败                  -> SIGNATURE_INVALID（签名内容不匹配）
-  //      - 签名文件本身格式非法（前面）            -> PROOF_INVALID
+  //      - 签名本身格式非法（前面）                -> PROOF_INVALID
   const providedFingerprint = keyFingerprint(publicKey);
   if (providedFingerprint.toLowerCase() !== proof.signerKeyFingerprint.toLowerCase()) {
     throw new ProvError(
@@ -655,7 +881,8 @@ export async function verify({
 
   // 6) 签名通过后重新扫描产物并逐项比对 —— 任何差异均为 INTEGRITY_MISMATCH。
   //    排除输出目录：证明/签名/清单通常与产物相邻，验证时不得把它们计入产物。
-  const excludeDir = inferExcludeDir(proofAbs, artifactAbs);
+  //    包模式以分发包所在目录作为排除目录（独立文件同样由其所在目录推断）。
+  const excludeDir = inferExcludeDir(proofLocation, artifactAbs);
   const currentSbom = await buildSbom(artifactAbs, excludeDir);
   const currentDigest = computeArtifactDigest(currentSbom);
 
@@ -668,18 +895,43 @@ export async function verify({
     );
   }
 
-  // 7) SBOM 模式：校验 sbom.json 结构、proof.sbomDigest、SBOM 签名，
-  //    并确认 SBOM 清单与证明清单（进而与当前扫描）逐项一致。
+  // 7) SBOM 校验：独立文件模式显式成对提供时进行；包模式始终进行（成员必在包内）。
+  //    结构、proof.sbomDigest、SBOM 签名、清单一致性逐项核校。
   let sbomDigest;
-  if (sbomMode) {
-    sbomDigest = await verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey });
+  if (bundleMode || sbomMode) {
+    sbomDigest = verifySbomBytes({ sbomBytes, sbomSigBytes, proof, publicKey });
   }
 
-  // 8) 共签模式：在证明、可选 SBOM 与产物完整性全部通过后，校验共签清单与各共签签名。
+  // 8) 共签模式：在证明、SBOM 与产物完整性全部通过后，才读取/解析共签清单并校验
+  //    各共签签名（与独立文件模式原有顺序一致：此前清单缺失/非法不应抢先报错）。
+  //    包模式的清单取自包内成员；独立文件模式取自 --cosignatures 目录。
   let cosignerCount;
   if (cosignMode) {
-    cosignerCount = await verifyCosignatures({
-      cosigDir,
+    if (bundleMode && proof.proofVersion !== PROOF_VERSION_COSIGN) {
+      throw new ProvError(ERROR_CODES.PROOF_INVALID, '分发包缺少共签清单成员（证明未启用共签）');
+    }
+    let proofCosignManifest;
+    let sbomCosignManifest;
+    if (bundleMode) {
+      proofCosignManifest = parseCosignManifest(proofCosignSource.bytes, '证明共签清单');
+      sbomCosignManifest = parseCosignManifest(sbomCosignSource.bytes, 'SBOM 共签清单');
+    } else {
+      for (const [src, label] of [
+        [proofCosignSource, '证明共签清单'],
+        [sbomCosignSource, 'SBOM 共签清单'],
+      ]) {
+        try {
+          await access(src.path, fsConstants.R_OK);
+        } catch (err) {
+          throw wrapFsError(err, `读取${label}`);
+        }
+      }
+      proofCosignManifest = await readCosignManifest(proofCosignSource.path, '证明共签清单');
+      sbomCosignManifest = await readCosignManifest(sbomCosignSource.path, 'SBOM 共签清单');
+    }
+    cosignerCount = verifyCosignaturesBytes({
+      proofManifest: proofCosignManifest,
+      sbomManifest: sbomCosignManifest,
       cosignerKeyPaths: cosignerKeyList,
       minCosigners,
       proof,
@@ -688,13 +940,14 @@ export async function verify({
     });
   }
 
-  // 9) 可选策略：仅在签名、完整性、可选 SBOM、可选共签校验全部通过后加载并执行。
+  // 9) 可选策略：仅在签名、完整性、SBOM、可选共签校验全部通过后加载并执行。
   //    策略文件自身缺失/不可读/非法按其错误码返回（INPUT_NOT_FOUND /
   //    PERMISSION_DENIED / POLICY_INVALID）；内容违规为 POLICY_VIOLATION。
+  //    包模式 SBOM 恒在包内并已校验，requireSbom 视为满足。
   let policyStatus;
   if (policyPath !== undefined) {
     const policy = await loadPolicy(policyPath);
-    const violations = evaluatePolicy(policy, proof, sbomMode);
+    const violations = evaluatePolicy(policy, proof, bundleMode || sbomMode);
     if (violations.length > 0) {
       throw new ProvError(
         ERROR_CODES.POLICY_VIOLATION,
@@ -711,19 +964,19 @@ export async function verify({
     artifactDigest: currentDigest,
     fileCount: currentSbom.files.length,
   };
-  if (sbomMode) result.sbomDigest = sbomDigest;
+  if (bundleMode || sbomMode) result.sbomDigest = sbomDigest;
   if (cosignMode) result.cosignerCount = cosignerCount;
   if (policyPath !== undefined) result.policyStatus = policyStatus;
   return result;
 }
 
-// SBOM 校验：结构 -> 摘要 -> 签名 -> 清单一致性。
-async function verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey }) {
+// SBOM 校验（以字节为输入）：结构 -> 摘要 -> 签名 -> 清单一致性。
+// 独立文件模式（读盘后传入）与分发包模式（成员解码后传入）共用。
+function verifySbomBytes({ sbomBytes, sbomSigBytes, proof, publicKey }) {
   // a) sbom.json 必须是可解析的 JSON 且结构合法 —— 否则 PROOF_INVALID。
-  const sbomText = await readFileUtf8(sbomAbs);
   let sbom;
   try {
-    sbom = JSON.parse(sbomText);
+    sbom = JSON.parse(sbomBytes.toString('utf8'));
   } catch {
     throw new ProvError(ERROR_CODES.PROOF_INVALID, 'SBOM 文件不是合法的 JSON');
   }
@@ -749,18 +1002,7 @@ async function verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey }) {
   }
 
   // d) SBOM 签名：合法 Base64 且 64 字节 —— 否则 PROOF_INVALID；验签失败 SIGNATURE_INVALID。
-  const sigText = await readFileUtf8(sbomSigAbs);
-  const sigB64 = sigText.replace(/\s+/g, '');
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
-    throw new ProvError(ERROR_CODES.PROOF_INVALID, 'SBOM 签名文件不是合法的 Base64 内容');
-  }
-  const sigBuf = Buffer.from(sigB64, 'base64');
-  if (sigBuf.length !== 64) {
-    throw new ProvError(
-      ERROR_CODES.PROOF_INVALID,
-      `SBOM 签名长度非法（Ed25519 应为 64 字节，实际 ${sigBuf.length} 字节）`,
-    );
-  }
+  const sigBuf = decodeSignatureBytes(sbomSigBytes, 'SBOM 签名文件');
   let sigOk = false;
   try {
     sigOk = cryptoVerify(null, Buffer.from(canonicalSbom, 'utf8'), publicKey, sigBuf);
@@ -787,6 +1029,22 @@ async function verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey }) {
   return recomputed;
 }
 
+// 解析签名文件字节：去空白后必须是合法 Base64 且恰好解码为 64 字节 Ed25519 签名。
+function decodeSignatureBytes(sigBytes, label) {
+  const sigB64 = sigBytes.toString('utf8').replace(/\s+/g, '');
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, `${label}不是合法的 Base64 内容`);
+  }
+  const sigBuf = Buffer.from(sigB64, 'base64');
+  if (sigBuf.length !== 64) {
+    throw new ProvError(
+      ERROR_CODES.PROOF_INVALID,
+      `${label}长度非法（Ed25519 应为 64 字节，实际 ${sigBuf.length} 字节）`,
+    );
+  }
+  return sigBuf;
+}
+
 // ---------------------------------------------------------------------------
 // 共签校验（proof.cosignatures.json / sbom.cosignatures.json）
 // ---------------------------------------------------------------------------
@@ -795,23 +1053,19 @@ async function verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey }) {
 // 校验顺序：清单可读性 -> 结构与绑定（PROOF_INVALID）-> SBOM 摘要复算
 // （INTEGRITY_MISMATCH）-> 共签公钥归属（KEY_NOT_FOUND）-> 逐签名验签与
 // 有效数量（SIGNATURE_INVALID）。返回有效共签者数量（按指纹去重）。
-async function verifyCosignatures({ cosigDir, cosignerKeyPaths, minCosigners, proof, canonicalProof, currentSbom }) {
-  const dir = resolve(cosigDir);
-  const proofManifestAbs = join(dir, 'proof.cosignatures.json');
-  const sbomManifestAbs = join(dir, 'sbom.cosignatures.json');
-  for (const [p, label] of [
-    [proofManifestAbs, '证明共签清单'],
-    [sbomManifestAbs, 'SBOM 共签清单'],
-  ]) {
-    try {
-      await access(p, fsConstants.R_OK);
-    } catch (err) {
-      throw wrapFsError(err, `读取${label}`);
-    }
-  }
-  const proofManifest = await readCosignManifest(proofManifestAbs, '证明共签清单');
-  const sbomManifest = await readCosignManifest(sbomManifestAbs, 'SBOM 共签清单');
-
+// 以清单对象为输入的共签校验核心，独立文件模式与分发包模式共用。
+// 校验顺序：清单结构与绑定（PROOF_INVALID）-> SBOM 摘要复算
+// （INTEGRITY_MISMATCH）-> 共签公钥归属（KEY_NOT_FOUND）-> 逐签名验签与
+// 有效数量（SIGNATURE_INVALID）。返回有效共签者数量（按指纹去重）。
+function verifyCosignaturesBytes({
+  proofManifest,
+  sbomManifest,
+  cosignerKeyPaths,
+  minCosigners,
+  proof,
+  canonicalProof,
+  currentSbom,
+}) {
   // 清单必须绑定当前证明：记录的产物/SBOM 摘要与证明一致。
   for (const [m, label] of [
     [proofManifest, '证明共签清单'],
@@ -908,9 +1162,13 @@ function verifyCosigSignature(signatureB64, canonicalBytes, publicKey) {
 
 async function readCosignManifest(path, label) {
   const text = await readFileUtf8(path);
+  return parseCosignManifest(text, label);
+}
+
+function parseCosignManifest(textOrBytes, label) {
   let manifest;
   try {
-    manifest = JSON.parse(text);
+    manifest = JSON.parse(textOrBytes.toString('utf8'));
   } catch {
     throw new ProvError(ERROR_CODES.PROOF_INVALID, `${label}不是合法的 JSON`);
   }
@@ -1345,9 +1603,10 @@ function usage() {
     '用法:',
     '  provguard keygen   --key-dir <dir> [--name <prefix>]',
     '  provguard generate --artifact <path> --key <private.pem> --out <dir> \\',
-    '                      [--co-key <private.pem> ...]',
-    '  provguard verify   --artifact <path> --proof <proof.json> \\',
-    '                      --signature <proof.json.sig> --key <public.pem> \\',
+    '                      [--co-key <private.pem> ...] [--bundle]',
+    '  provguard verify   --artifact <path> --key <public.pem> \\',
+    '                      (--proof <proof.json> --signature <proof.json.sig> | \\',
+    '                       --bundle <proof.bundle.json>) \\',
     '                      [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \\',
     '                      [--cosignatures <dir> --cosigner-key <public.pem> ... \\',
     '                       --min-cosigners <n>] \\',
@@ -1355,6 +1614,7 @@ function usage() {
     '',
     'generate 输出: proof.json / proof.json.sig / sbom.json / sbom.json.sig',
     '启用共签时额外输出: proof.cosignatures.json / sbom.cosignatures.json',
+    '使用 --bundle 时再额外输出: proof.bundle.json（上述文件的单文件分发包）',
     '成功状态: VERIFIED；错误码见 README。',
   ].join('\n');
 }
@@ -1403,7 +1663,17 @@ async function main(argv) {
       if (coKeys.some((k) => typeof k !== 'string')) {
         throw new ProvError(ERROR_CODES.USAGE_ERROR, '--co-key 需要提供共签私钥文件路径');
       }
-      const r = await generate({ artifact: args.artifact, key: args.key, out: args.out, coKeys });
+      // --bundle 为布尔开关，不取值。
+      if (args.bundle !== undefined && args.bundle !== true) {
+        throw new ProvError(ERROR_CODES.USAGE_ERROR, '--bundle 是开关参数，不接受取值');
+      }
+      const r = await generate({
+        artifact: args.artifact,
+        key: args.key,
+        out: args.out,
+        coKeys,
+        bundle: args.bundle === true,
+      });
       const out = {
         status: 'GENERATED',
         proofVersion: r.proofVersion,
@@ -1414,6 +1684,7 @@ async function main(argv) {
         signaturePath: r.signaturePath,
         sbomSignaturePath: r.sbomSignaturePath,
       };
+      if (r.bundlePath !== undefined) out.bundlePath = r.bundlePath;
       if (r.cosignerCount !== undefined) {
         out.cosignerCount = r.cosignerCount;
         out.proofCosignaturesPath = r.proofCosignaturesPath;
@@ -1424,14 +1695,39 @@ async function main(argv) {
     }
 
     if (command === 'verify') {
-      const missing = ['artifact', 'proof', 'signature', 'key'].filter((k) => typeof args[k] !== 'string');
-      if (missing.length) {
+      // --artifact 与 --key 在两种模式下均必填。
+      const baseMissing = ['artifact', 'key'].filter((k) => typeof args[k] !== 'string');
+      if (baseMissing.length) {
         throw new ProvError(
           ERROR_CODES.USAGE_ERROR,
-          `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}`,
+          `缺少必填参数: ${baseMissing.map((m) => `--${m}`).join(', ')}`,
         );
       }
-      // --sbom 与 --sbom-signature 必须成对出现。
+
+      // 分发包模式：--bundle 与独立文件输入互斥。
+      const hasBundle = args.bundle !== undefined;
+      const standaloneInputs = ['proof', 'signature', 'sbom', 'sbom-signature', 'cosignatures'];
+      if (hasBundle) {
+        if (typeof args.bundle !== 'string') {
+          throw new ProvError(ERROR_CODES.USAGE_ERROR, '--bundle 需要提供分发包文件路径');
+        }
+        const mixed = standaloneInputs.filter((k) => args[k] !== undefined);
+        if (mixed.length) {
+          throw new ProvError(
+            ERROR_CODES.USAGE_ERROR,
+            `--bundle 与 --${mixed[0]} 等独立文件参数互斥`,
+          );
+        }
+      } else {
+        const missing = ['proof', 'signature'].filter((k) => typeof args[k] !== 'string');
+        if (missing.length) {
+          throw new ProvError(
+            ERROR_CODES.USAGE_ERROR,
+            `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}（或改用 --bundle）`,
+          );
+        }
+      }
+      // --sbom 与 --sbom-signature 必须成对出现（仅独立文件模式可达）。
       const hasSbom = typeof args.sbom === 'string';
       const hasSbomSig = typeof args['sbom-signature'] === 'string';
       if (hasSbom !== hasSbomSig) {
@@ -1442,8 +1738,10 @@ async function main(argv) {
       if (hasPolicy && typeof args.policy !== 'string') {
         throw new ProvError(ERROR_CODES.USAGE_ERROR, '--policy 需要提供策略文件路径');
       }
-      // 共签校验：--cosignatures、--cosigner-key（可重复）、--min-cosigners 必须同时提供，
-      // 且 min 为不超过公钥数量的正整数。
+      // 共签校验：
+      //   独立文件模式 —— --cosignatures、--cosigner-key（可重复）、--min-cosigners 必须同时提供；
+      //   包模式       —— 没有 --cosignatures（清单在包内），--cosigner-key 与 --min-cosigners
+      //                  仍须成对，且 min 为不超过公钥数量的正整数。
       const cosigKeysRaw = args['cosigner-key'];
       const anyCosign =
         args.cosignatures !== undefined || cosigKeysRaw !== undefined || args['min-cosigners'] !== undefined;
@@ -1456,10 +1754,13 @@ async function main(argv) {
         const minRaw = args['min-cosigners'];
         const minOk =
           typeof minRaw === 'string' && /^\d+$/.test(minRaw) && Number.isSafeInteger(Number(minRaw)) && Number(minRaw) >= 1;
-        if (typeof args.cosignatures !== 'string' || !keyListOk || !minOk) {
+        const dirOk = hasBundle || typeof args.cosignatures === 'string';
+        if (!dirOk || !keyListOk || !minOk) {
           throw new ProvError(
             ERROR_CODES.USAGE_ERROR,
-            '--cosignatures、--cosigner-key（可重复）与 --min-cosigners（正整数）必须同时提供',
+            hasBundle
+              ? '包模式下 --cosigner-key（可重复）与 --min-cosigners（正整数）必须同时提供'
+              : '--cosignatures、--cosigner-key（可重复）与 --min-cosigners（正整数）必须同时提供',
           );
         }
         if (Number(minRaw) > cosigKeysRaw.length) {
@@ -1469,16 +1770,17 @@ async function main(argv) {
           );
         }
         cosignOpts = {
-          cosignatures: args.cosignatures,
           cosignerKeys: cosigKeysRaw,
           minCosigners: Number(minRaw),
         };
+        if (!hasBundle) cosignOpts.cosignatures = args.cosignatures;
       }
       const r = await verify({
         artifact: args.artifact,
-        proof: args.proof,
-        signature: args.signature,
         key: args.key,
+        bundle: hasBundle ? args.bundle : undefined,
+        proof: hasBundle ? undefined : args.proof,
+        signature: hasBundle ? undefined : args.signature,
         sbom: hasSbom ? args.sbom : undefined,
         sbomSignature: hasSbomSig ? args['sbom-signature'] : undefined,
         policy: hasPolicy ? args.policy : undefined,
