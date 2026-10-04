@@ -15,6 +15,8 @@
 - SBOM 纳入签名保护：`proof.json` 记录 `sbomDigest`，`sbom.json.sig` 对 SBOM 规范字节单独签名，防止证明有效而 `sbom.json` 被替换；
 - 证明验证：签名校验 + 逐文件完整性比对，覆盖字节改动、文件新增与删除；
 - 可选验证策略（`--policy`）：时间窗口、签名密钥指纹白名单、强制 SBOM、文件数与总大小上限；
+  策略版本 `1.1` 额外支持发布准入的文件级约束（`requiredFiles` 必需文件及内容 SHA-256、
+  `forbiddenFiles` 禁止文件，按清单 Unicode 路径精确匹配）；
 - 可选多方共签：`generate --co-key` 附加共签私钥（证明版本升为 1.1 并声明共签者指纹，
   额外输出 `proof.cosignatures.json` / `sbom.cosignatures.json`）；
   `verify --cosignatures/--cosigner-key/--min-cosigners` 校验共签并输出 `cosignerCount`；
@@ -230,17 +232,19 @@ node provguard.mjs verify \
 
 不传 `--policy` 时行为完全不变。启用策略签名（`--policy-signature` + `--policy-key`）
 只额外增加“策略来自指定密钥”的签名校验，策略文件格式与规则完全不变。策略文件为 UTF-8
-JSON 对象，仅允许以下字段：
+JSON 对象，`policyVersion` 仅接受 `"1.0"` 与 `"1.1"`；仅允许以下字段：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `policyVersion` | 字符串 | **必填**，当前固定为 `"1.0"` |
+| `policyVersion` | 字符串 | **必填**，`"1.0"` 或 `"1.1"` |
 | `proofNotBefore` | UTC ISO-8601 字符串 | 允许的最早 `proof.generatedAt`（闭区间，可选） |
 | `proofNotAfter` | UTC ISO-8601 字符串 | 允许的最晚 `proof.generatedAt`（闭区间，可选） |
 | `allowedKeyFingerprints` | 字符串数组 | 受信任签名公钥指纹白名单（64 位 SHA-256 十六进制，可选；缺省不约束，**显式空数组不接受**） |
 | `requireSbom` | 布尔 | 为 `true` 时必须成对提供 `--sbom`/`--sbom-signature` 且校验通过（可选，缺省 false） |
 | `maxFileCount` | 非负安全整数 | `proof.files.length` 上限（可选，含边界） |
 | `maxSize` | 非负安全整数 | `proof.size` 总字节数上限（可选，含边界） |
+| `requiredFiles` | 对象 | **仅 1.1**。键为产物清单中的正斜杠相对路径，值为该文件内容的 64 位**小写**十六进制 SHA-256；出现时必须为**非空对象**（可选） |
+| `forbiddenFiles` | 字符串数组 | **仅 1.1**。清单中不得出现的正斜杠相对路径；出现时必须为**非空数组**且路径不重复（可选） |
 
 规则细节：
 
@@ -253,8 +257,35 @@ JSON 对象，仅允许以下字段：
 - 策略只在签名、完整性、可选 SBOM 校验**全部通过后**加载执行；伪造、篡改等仍按原错误码
   返回，不会落到策略结果。策略文件缺失报 `INPUT_NOT_FOUND`、不可读报 `PERMISSION_DENIED`。
 
+#### 策略版本
+
+- `"1.0"`：接受上述全部旧字段，**不得**携带 `requiredFiles` / `forbiddenFiles`，否则
+  `POLICY_INVALID`。
+- `"1.1"`：接受全部旧字段，并可有 `requiredFiles` 与 `forbiddenFiles`（均可缺省）。
+  两字段互不影响其余规则；`policy-sign` 对两个版本的签名都逐字节确定，且不改写策略。
+- 其他版本号一律 `POLICY_INVALID`。
+
+#### 1.1 文件级路径与摘要约束
+
+- 路径键（`requiredFiles`）与路径数组（`forbiddenFiles`）必须是产物清单中的正斜杠相对路径，
+  按清单的 Unicode 原样**精确匹配（大小写敏感）**：不得为空字符串、绝对路径（以 `/` 开头）、
+  含反斜杠、空路径段（相邻 `/` 或尾随 `/`），也不得含点目录段（`.` / `..`）。
+- `requiredFiles` 的值必须恰好为 64 位**小写**十六进制 SHA-256（大写摘要非法）。
+- `forbiddenFiles` 路径不得重复；同一路径不得同时出现在 `requiredFiles` 与
+  `forbiddenFiles`（约束重叠为 `POLICY_INVALID`）。
+- 结构、类型、取值、摘要或路径非法，以及空对象/空数组，均为 `POLICY_INVALID`。
+
+文件级规则在主签名、SBOM、共签、完整性及可选策略签名全部通过之后才评估（此时证明清单与
+当前产物逐项一致，直接以清单为真）：
+
+- `requiredFiles` 中的路径在清单中缺失 → `required-file-missing`，`observed` 为该路径；
+- 路径存在但内容摘要不符 → `required-file-digest-mismatch`，`observed` 为清单中的**实际摘要**；
+- `forbiddenFiles` 中的路径在清单中出现 → `forbidden-file-present`，`observed` 为该路径。
+
 策略违规时 stderr 输出 `POLICY_VIOLATION`，`details.violations` 按
-**时间 → 密钥 → SBOM → 文件数 → 大小** 排序，每项含 `rule` 与 `observed`：
+**时间 → 密钥 → SBOM → 文件数 → 大小 → 文件级规则** 排序；文件级规则内部依次为
+`required-file-missing` → `required-file-digest-mismatch` → `forbidden-file-present`，
+**同类按路径的 UTF-16 码元升序**。每项含 `rule` 与 `observed`：
 
 ```json
 {
@@ -263,8 +294,8 @@ JSON 对象，仅允许以下字段：
   "message": "策略校验未通过（2 项违规）",
   "details": {
     "violations": [
-      { "rule": "allowed-key-fingerprints", "observed": "<proof 中的指纹>" },
-      { "rule": "max-file-count", "observed": 7 }
+      { "rule": "required-file-missing", "observed": "sub/missing.txt" },
+      { "rule": "forbidden-file-present", "observed": "evil.bin" }
     ]
   }
 }
@@ -272,7 +303,9 @@ JSON 对象，仅允许以下字段：
 
 可能的 `rule`：`generated-at-invalid` / `proof-not-before` / `proof-not-after` /
 `allowed-key-fingerprints` / `require-sbom`（`observed` 为 `"absent"`）/
-`max-file-count` / `max-size`。
+`max-file-count` / `max-size` / `required-file-missing`（`observed` 为路径）/
+`required-file-digest-mismatch`（`observed` 为实际摘要）/
+`forbidden-file-present`（`observed` 为路径）。
 
 ## 错误码
 
@@ -295,8 +328,8 @@ JSON 对象，仅允许以下字段：
 | `PROOF_INVALID` | 证明、SBOM 或共签清单的 JSON 不可解析、结构或摘要非法；签名文件不是合法 Base64 或长度非法；共签清单含主签名指纹、指纹重复、与证明声明的签名者集合不一致；分发包 JSON 不可解析、`bundleVersion` 非 `"1.0"`、成员缺失或多余、成员 Base64 非法、字节长度或 SHA-256 与内容不符、共签成员与证明声明不一致 |
 | `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏）；共签签名与内容不匹配，或有效共签数量不足 `--min-cosigners`；策略合法但策略签名不是合法 Base64、长度非 64 字节、与策略规范字节不符或策略公钥不匹配 |
 | `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增/删除/重命名，或 `sbom.json`（或共签校验时复算的 SBOM）与证明记录的 `sbomDigest` 不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch`） |
-| `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter`（验证与 `policy-sign` 相同） |
-| `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小排序列出全部违规，每项含 `rule` 与 `observed` |
+| `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`/`"1.1"`、指纹白名单为空数组、`proofNotBefore` 晚于 `proofNotAfter`、1.0 携带 `requiredFiles`/`forbiddenFiles`、1.1 文件级字段为空对象/空数组或类型非法、路径为空/绝对/含反斜杠/空路径段/点目录段、摘要不是 64 位小写十六进制、`forbiddenFiles` 重复或与 `requiredFiles` 重叠（验证与 `policy-sign` 相同） |
+| `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM、共签、策略签名）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小、文件级规则（必需缺失 → 必需摘要不符 → 禁止出现，同类按路径 UTF-16 码元升序）列出全部违规，每项含 `rule` 与 `observed` |
 | `SYMLINK_INVALID` | 目录扫描发现危险符号链接：形成回路（`details.reason` 为 `cycle`）或目标越出产物根目录（`details.reason` 为 `outside-root`）；`details.path` 为链接的相对路径。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败 |
 | `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量，`--bundle` 与独立文件参数（`--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures`）混用，包模式下 `--cosigner-key` 与 `--min-cosigners` 未同时提供，`policy-sign` 缺少 `--policy`/`--key`/`--signature`，或 `--policy-signature` 与 `--policy-key` 缺值、只给一者、未与 `--policy` 同时提供 |
 
@@ -337,6 +370,11 @@ node --test
 以及字节篡改、新增/删除、错误公钥、非法签名、非法证明、缺失路径与私钥不可解析等错误路径；
 策略测试覆盖通过（PASS）、闭区间边界、指纹大小写不敏感、`requireSbom`、上限边界、
 违规排序、`generated-at-invalid`、策略文件各类非法情形、缺失/不可读以及篡改优先；
+策略 1.1 文件级规则测试覆盖必需文件通过/缺失/摘要不符（observed 为实际摘要）、禁止文件
+出现、多规则整体排序（旧规则在前、同类按路径 UTF-16 码元升序）、路径 Unicode 大小写
+敏感、空对象/空数组、空/绝对/反斜杠/空路径段/点目录段路径、大写或非法摘要、
+`forbiddenFiles` 重复、两字段重叠、1.0 携带新字段、未知版本，以及与策略签名、分发包、
+共签组合的往返；
 符号链接测试覆盖越出根目录（outside-root）、指回祖先与互相成环（cycle）、ELOOP、
 generate 失败前不写证明、verify 扫描阶段报错，以及安全内部链接的记录与稳定性；
 共签测试覆盖双清单往返与结构、缺省不创建清单、1.1 证明的旧路径验证、重复/同源

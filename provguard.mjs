@@ -1473,6 +1473,22 @@ function diffSbomAgainstProof(sbom, proof) {
 // ---------------------------------------------------------------------------
 
 export const POLICY_VERSION = '1.0';
+// 1.1 起支持发布准入的文件级约束（requiredFiles / forbiddenFiles）。
+export const POLICY_VERSION_FILE_RULES = '1.1';
+export const POLICY_VERSIONS = Object.freeze([POLICY_VERSION, POLICY_VERSION_FILE_RULES]);
+
+// 文件级策略路径合法性：键/值必须为非空字符串，使用正斜杠的相对路径，
+// 不得为绝对路径、含反斜杠、空路径段或以点目录（. / ..）作为路径段。
+// 路径按清单的 Unicode 原样精确匹配（大小写敏感），不做归一化。
+function isValidPolicyRelPath(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  if (value.includes('\\')) return false;
+  if (value.startsWith('/')) return false;
+  const segments = value.split('/');
+  if (segments.some((seg) => seg.length === 0)) return false;
+  if (segments.includes('.') || segments.includes('..')) return false;
+  return true;
+}
 
 // 严格解析 UTC ISO-8601：仅接受以 Z 结尾、年月日时分秒（秒可带任意位小数）
 // 均为数字且取值合法的时间；其余一律视为非法（包括 +00:00 偏移写法）。
@@ -1529,7 +1545,8 @@ async function loadPolicy(policyPath) {
 }
 
 // 策略对象的严格结构校验：返回错误说明字符串，合法时返回 null。
-// 非对象、未知字段、非法类型或取值、policyVersion 非 "1.0"、时间区间倒置均为非法。
+// 非对象、未知字段、非法类型或取值、policyVersion 非 "1.0"/"1.1"、时间区间倒置、
+// 文件级路径/摘要非法、forbiddenFiles 重复或与 requiredFiles 重叠均为非法。
 function validatePolicyObject(policy) {
   if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
     return '策略顶层必须是 JSON 对象';
@@ -1543,6 +1560,9 @@ function validatePolicyObject(policy) {
     'requireSbom',
     'maxFileCount',
     'maxSize',
+    // 1.1 文件级发布准入规则。
+    'requiredFiles',
+    'forbiddenFiles',
   ]);
   for (const key of Object.keys(policy)) {
     if (!allowed.has(key)) {
@@ -1550,15 +1570,21 @@ function validatePolicyObject(policy) {
     }
   }
 
-  // policyVersion 必填，字符串且固定为 "1.0"。
+  // policyVersion 必填，字符串且仅接受 "1.0" 与 "1.1"。
   if (policy.policyVersion === undefined) {
     return '策略缺少必填字段: policyVersion';
   }
   if (typeof policy.policyVersion !== 'string') {
     return '策略字段类型非法: policyVersion';
   }
-  if (policy.policyVersion !== POLICY_VERSION) {
+  if (!POLICY_VERSIONS.includes(policy.policyVersion)) {
     return `不支持的策略版本: ${policy.policyVersion}`;
+  }
+  const isV11 = policy.policyVersion === POLICY_VERSION_FILE_RULES;
+
+  // 文件级字段仅允许出现在 1.1：1.0 携带任一即视为非法字段。
+  if (!isV11 && (policy.requiredFiles !== undefined || policy.forbiddenFiles !== undefined)) {
+    return '策略 1.0 不支持字段: requiredFiles / forbiddenFiles（需要 policyVersion 1.1）';
   }
 
   // 时间字段可选；出现时必须是合法 UTC ISO-8601 字符串。
@@ -1599,12 +1625,67 @@ function validatePolicyObject(policy) {
     }
   }
 
+  // 1.1 文件级发布准入规则。
+  if (isV11) {
+    const fileRuleError = validateFileRules(policy);
+    if (fileRuleError) return fileRuleError;
+  }
+
+  return null;
+}
+
+// requiredFiles：非空对象，键为清单正斜杠相对路径，值为 64 位**小写**十六进制 SHA-256。
+// forbiddenFiles：非空路径数组，路径合法且不得重复；两组路径不得重叠。
+function validateFileRules(policy) {
+  const requiredPaths = new Set();
+  if (policy.requiredFiles !== undefined) {
+    const req = policy.requiredFiles;
+    if (req === null || typeof req !== 'object' || Array.isArray(req)) {
+      return '策略字段类型非法: requiredFiles';
+    }
+    if (Object.keys(req).length === 0) {
+      return '策略字段 requiredFiles 不允许为空对象';
+    }
+    for (const [path, digest] of Object.entries(req)) {
+      if (!isValidPolicyRelPath(path)) {
+        return `策略字段 requiredFiles 路径非法: ${path}`;
+      }
+      if (typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest)) {
+        return `策略字段 requiredFiles 摘要非法（应为 64 位小写十六进制 SHA-256）: ${path}`;
+      }
+      requiredPaths.add(path);
+    }
+  }
+
+  if (policy.forbiddenFiles !== undefined) {
+    if (!Array.isArray(policy.forbiddenFiles)) {
+      return '策略字段类型非法: forbiddenFiles';
+    }
+    if (policy.forbiddenFiles.length === 0) {
+      return '策略字段 forbiddenFiles 不允许为空数组';
+    }
+    const seen = new Set();
+    for (const path of policy.forbiddenFiles) {
+      if (!isValidPolicyRelPath(path)) {
+        return `策略字段 forbiddenFiles 路径非法: ${path}`;
+      }
+      if (seen.has(path)) {
+        return `策略字段 forbiddenFiles 路径重复: ${path}`;
+      }
+      seen.add(path);
+      if (requiredPaths.has(path)) {
+        return `策略文件约束重叠（同一路径不得同时出现在 requiredFiles 与 forbiddenFiles）: ${path}`;
+      }
+    }
+  }
+
   return null;
 }
 
 // 在签名、完整性、可选 SBOM 校验全部通过后执行策略。
-// 返回违规列表（已按时间、密钥、SBOM、文件数、大小排序）；空列表表示通过。
-// 每条违规形如 { rule, observed }。
+// 返回违规列表（已按时间、密钥、SBOM、文件数、大小、文件级规则排序）；空列表表示通过。
+// 1.1 文件级规则内部依次为 required-file-missing、required-file-digest-mismatch、
+// forbidden-file-present，同类按路径的 UTF-16 码元升序。每条违规形如 { rule, observed }。
 function evaluatePolicy(policy, proof, sbomMode) {
   const violations = [];
   const push = (rule, observed) => violations.push({ rule, observed });
@@ -1644,6 +1725,41 @@ function evaluatePolicy(policy, proof, sbomMode) {
   // 5) 总大小上限。
   if (policy.maxSize !== undefined && proof.size > policy.maxSize) {
     push('max-size', proof.size);
+  }
+
+  // 6) 1.1 文件级发布准入规则。至此完整性已通过，proof.files 与当前产物逐项一致，
+  //    直接以清单（path -> sha256）为真做 Unicode 原样、大小写敏感的精确匹配。
+  if (policy.requiredFiles !== undefined || policy.forbiddenFiles !== undefined) {
+    const byPath = new Map(proof.files.map((f) => [f.path, f]));
+    const requiredMissing = [];
+    const requiredDigest = [];
+    const forbiddenPresent = [];
+    if (policy.requiredFiles !== undefined) {
+      for (const [path, expectedDigest] of Object.entries(policy.requiredFiles)) {
+        const entry = byPath.get(path);
+        if (!entry) {
+          requiredMissing.push(path);
+        } else if (entry.sha256.toLowerCase() !== expectedDigest.toLowerCase()) {
+          // observed 为清单中该路径的实际摘要（生成时写出的小写十六进制）。
+          requiredDigest.push([path, entry.sha256]);
+        }
+      }
+    }
+    if (policy.forbiddenFiles !== undefined) {
+      for (const path of policy.forbiddenFiles) {
+        if (byPath.has(path)) forbiddenPresent.push(path);
+      }
+    }
+    // 同类按路径 UTF-16 码元升序（JS 默认字符串比较）。
+    const byUtf16 = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    requiredMissing.sort(byUtf16);
+    requiredDigest.sort(([a], [b]) => byUtf16(a, b));
+    forbiddenPresent.sort(byUtf16);
+    for (const path of requiredMissing) push('required-file-missing', path);
+    for (const [, actualDigest] of requiredDigest) {
+      push('required-file-digest-mismatch', actualDigest);
+    }
+    for (const path of forbiddenPresent) push('forbidden-file-present', path);
   }
 
   return violations;
