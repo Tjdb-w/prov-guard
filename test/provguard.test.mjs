@@ -1,7 +1,7 @@
 // Prov Guard 端到端测试：以子进程方式驱动 provguard.mjs CLI。
 // 运行：node --test
 import { spawnSync } from 'node:child_process';
-import { sign as cryptoSign, createPrivateKey } from 'node:crypto';
+import { sign as cryptoSign, createPrivateKey, createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1112,4 +1112,271 @@ test('共签与策略组合：共签通过后才执行策略，全通过输出 c
   assert.equal(v.stdout.status, 'VERIFIED');
   assert.equal(v.stdout.cosignerCount, 1);
   assert.equal(v.stdout.policyStatus, 'PASS');
+});
+
+// ---------------------------------------------------------------------------
+// 证明分发包（generate --bundle；verify --bundle）
+// ---------------------------------------------------------------------------
+
+function generateBundle(artifact, key, out, extra = []) {
+  const r = run(['generate', '--artifact', artifact, '--key', key, '--out', out, ...extra, '--bundle']);
+  assert.equal(r.code, 0, JSON.stringify(r.stderr));
+  return r.stdout;
+}
+
+function verifyBundle(artifact, bundlePath, pub, extra = []) {
+  return run(['verify', '--artifact', artifact, '--bundle', bundlePath, '--key', pub, ...extra]);
+}
+
+function readBundle(out = paths.out) {
+  return JSON.parse(readFileSync(join(out, 'proof.bundle.json'), 'utf8'));
+}
+
+// 修改包内某成员后回写；transform 接收解码后的字节，返回新字节。
+// 默认同步更新 sha256 与 size（构造“自洽但内容被改”的包）。
+function rewriteBundleMember(name, transform, { fixMeta = true } = {}) {
+  const p = join(paths.out, 'proof.bundle.json');
+  const b = JSON.parse(readFileSync(p, 'utf8'));
+  const bytes = transform(Buffer.from(b.members[name].data, 'base64'));
+  b.members[name].data = bytes.toString('base64');
+  if (fixMeta) {
+    b.members[name].sha256 = createHash('sha256').update(bytes).digest('hex');
+    b.members[name].size = bytes.length;
+  }
+  writeFileSync(p, JSON.stringify(b, null, 2) + '\n');
+}
+
+test('generate --bundle：独立文件照常输出，另生成 proof.bundle.json，成员字节与原文件一致', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  assert.ok(g.bundlePath.endsWith('proof.bundle.json'));
+  for (const f of ['proof.json', 'proof.json.sig', 'sbom.json', 'sbom.json.sig']) {
+    assert.ok(existsSync(join(paths.out, f)), `独立文件 ${f} 应照常输出`);
+  }
+  const b = readBundle();
+  assert.equal(b.bundleVersion, '1.0');
+  assert.deepEqual(Object.keys(b.members), ['proof', 'proof-signature', 'sbom', 'sbom-signature']);
+  const fileOf = {
+    proof: 'proof.json',
+    'proof-signature': 'proof.json.sig',
+    sbom: 'sbom.json',
+    'sbom-signature': 'sbom.json.sig',
+  };
+  for (const [name, file] of Object.entries(fileOf)) {
+    const disk = readFileSync(join(paths.out, file));
+    const m = b.members[name];
+    assert.equal(m.size, disk.length, name);
+    assert.equal(m.sha256, createHash('sha256').update(disk).digest('hex'), name);
+    assert.deepEqual(Buffer.from(m.data, 'base64'), disk, `${name} 应保留原文件字节`);
+  }
+});
+
+test('不使用 --bundle 时不生成 proof.bundle.json，输出字段不变', () => {
+  const k = keygen(paths.keys);
+  const g = generate(paths.art, k.priv, paths.out);
+  assert.equal(g.bundlePath, undefined);
+  assert.ok(!existsSync(join(paths.out, 'proof.bundle.json')));
+});
+
+test('分发包确定性：重复生成时成员顺序一致，sbom 等成员逐字节稳定', () => {
+  const k = keygen(paths.keys);
+  const o1 = join(root, 'b1');
+  const o2 = join(root, 'b2');
+  generateBundle(paths.art, k.priv, o1);
+  generateBundle(paths.art, k.priv, o2);
+  const b1 = readBundle(o1);
+  const b2 = readBundle(o2);
+  assert.deepEqual(Object.keys(b1.members), Object.keys(b2.members));
+  assert.deepEqual(Object.keys(b1.members['sbom']), Object.keys(b2.members['sbom']));
+  for (const name of ['sbom', 'sbom-signature']) {
+    assert.deepEqual(b1.members[name], b2.members[name], `${name} 应逐字节稳定`);
+  }
+});
+
+test('verify --bundle 往返成功，输出字段与独立文件模式一致（含 sbomDigest）', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  const v = verifyBundle(paths.art, g.bundlePath, k.pub);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.proofVersion, '1.0');
+  assert.equal(v.stdout.artifactDigest, g.artifactDigest);
+  assert.equal(v.stdout.fileCount, 4);
+  const proof = JSON.parse(readFileSync(join(paths.out, 'proof.json'), 'utf8'));
+  assert.equal(v.stdout.sbomDigest, proof.sbomDigest);
+});
+
+test('--bundle 与独立文件参数混用 -> USAGE_ERROR', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  const base = ['verify', '--artifact', paths.art, '--bundle', g.bundlePath, '--key', k.pub];
+  for (const extra of [
+    ['--proof', join(paths.out, 'proof.json')],
+    ['--signature', join(paths.out, 'proof.json.sig')],
+    ['--sbom', join(paths.out, 'sbom.json')],
+    ['--sbom-signature', join(paths.out, 'sbom.json.sig')],
+    ['--cosignatures', paths.out],
+  ]) {
+    const v = run([...base, ...extra]);
+    assert.equal(v.code, 1, extra[0]);
+    assert.equal(v.stderr.errorCode, 'USAGE_ERROR', extra[0]);
+  }
+});
+
+test('--bundle 缺路径、缺 --artifact/--key，或共签参数缺一 -> USAGE_ERROR', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  assert.equal(run(['verify', '--artifact', paths.art, '--bundle', '--key', k.pub]).stderr.errorCode, 'USAGE_ERROR');
+  assert.equal(run(['verify', '--bundle', g.bundlePath, '--key', k.pub]).stderr.errorCode, 'USAGE_ERROR');
+  assert.equal(run(['verify', '--artifact', paths.art, '--bundle', g.bundlePath]).stderr.errorCode, 'USAGE_ERROR');
+  // 共签参数只给一者
+  const k2 = keygen(paths.keys2);
+  assert.equal(
+    verifyBundle(paths.art, g.bundlePath, k.pub, ['--cosigner-key', k2.pub]).stderr.errorCode,
+    'USAGE_ERROR',
+  );
+  assert.equal(
+    verifyBundle(paths.art, g.bundlePath, k.pub, ['--min-cosigners', '1']).stderr.errorCode,
+    'USAGE_ERROR',
+  );
+});
+
+test('分发包路径不存在 -> INPUT_NOT_FOUND', () => {
+  const k = keygen(paths.keys);
+  const v = verifyBundle(paths.art, join(root, 'nope.bundle.json'), k.pub);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'INPUT_NOT_FOUND');
+});
+
+test('包 JSON 不可解析 / bundleVersion 非 1.0 -> PROOF_INVALID', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  const broken = join(root, 'broken.bundle.json');
+  writeFileSync(broken, '{broken');
+  assert.equal(verifyBundle(paths.art, broken, k.pub).stderr.errorCode, 'PROOF_INVALID');
+
+  const b = readBundle();
+  b.bundleVersion = '2.0';
+  writeFileSync(g.bundlePath, JSON.stringify(b));
+  assert.equal(verifyBundle(paths.art, g.bundlePath, k.pub).stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('成员缺失或多余 -> PROOF_INVALID', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+
+  const missing = readBundle();
+  delete missing.members.sbom;
+  const p1 = join(root, 'missing.bundle.json');
+  writeFileSync(p1, JSON.stringify(missing));
+  assert.equal(verifyBundle(paths.art, p1, k.pub).stderr.errorCode, 'PROOF_INVALID');
+
+  const extra = readBundle();
+  extra.members['extra-file'] = extra.members.sbom;
+  writeFileSync(g.bundlePath, JSON.stringify(extra));
+  assert.equal(verifyBundle(paths.art, g.bundlePath, k.pub).stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('成员 Base64 非法 / 长度不符 / SHA-256 不符 -> PROOF_INVALID', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+
+  const badB64 = readBundle();
+  badB64.members.sbom.data = '!!! not base64 !!!';
+  const p1 = join(root, 'badb64.bundle.json');
+  writeFileSync(p1, JSON.stringify(badB64));
+  assert.equal(verifyBundle(paths.art, p1, k.pub).stderr.errorCode, 'PROOF_INVALID');
+
+  const badSize = readBundle();
+  badSize.members.sbom.size += 1;
+  const p2 = join(root, 'badsize.bundle.json');
+  writeFileSync(p2, JSON.stringify(badSize));
+  assert.equal(verifyBundle(paths.art, p2, k.pub).stderr.errorCode, 'PROOF_INVALID');
+
+  const badSha = readBundle();
+  badSha.members.sbom.sha256 = '0'.repeat(64);
+  writeFileSync(g.bundlePath, JSON.stringify(badSha));
+  assert.equal(verifyBundle(paths.art, g.bundlePath, k.pub).stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('包内证明被篡改（成员摘要同步更新）-> SIGNATURE_INVALID', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  rewriteBundleMember('proof', (bytes) => {
+    const proof = JSON.parse(bytes.toString('utf8'));
+    proof.generatedAt = '2000-01-01T00:00:00.000Z';
+    return Buffer.from(JSON.stringify(proof, null, 2) + '\n', 'utf8');
+  });
+  const v = verifyBundle(paths.art, g.bundlePath, k.pub);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('包模式：错误主公钥 -> KEY_NOT_FOUND；产物篡改 -> INTEGRITY_MISMATCH', () => {
+  const k = keygen(paths.keys);
+  const k2 = keygen(paths.keys2);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  assert.equal(verifyBundle(paths.art, g.bundlePath, k2.pub).stderr.errorCode, 'KEY_NOT_FOUND');
+
+  writeFileSync(join(paths.art, 'a.txt'), 'CHANGED\n');
+  const v = verifyBundle(paths.art, g.bundlePath, k.pub);
+  assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
+  assert.ok(v.stderr.details.mismatches.some((m) => m.path === 'a.txt' && m.kind === 'content-modified'));
+});
+
+test('共签分发包：含共签成员，verify --bundle 校验共签并输出 cosignerCount', () => {
+  const { main, co1, co2 } = setupCosign();
+  const g = generateBundle(paths.art, main.priv, paths.out, ['--co-key', co2.priv, '--co-key', co1.priv]);
+  assert.equal(g.proofVersion, '1.1');
+  const b = readBundle();
+  assert.deepEqual(Object.keys(b.members), [
+    'proof',
+    'proof-cosignatures',
+    'proof-signature',
+    'sbom',
+    'sbom-cosignatures',
+    'sbom-signature',
+  ]);
+  // 共签成员字节与独立清单文件一致
+  assert.deepEqual(
+    Buffer.from(b.members['proof-cosignatures'].data, 'base64'),
+    readFileSync(join(paths.out, 'proof.cosignatures.json')),
+  );
+  const v = verifyBundle(paths.art, g.bundlePath, main.pub, [
+    '--cosigner-key', co1.pub,
+    '--cosigner-key', co2.pub,
+    '--min-cosigners', '2',
+  ]);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.cosignerCount, 2);
+});
+
+test('共签包被移除共签成员（证明仍声明共签者）-> PROOF_INVALID', () => {
+  const { main, co1 } = setupCosign();
+  const g = generateBundle(paths.art, main.priv, paths.out, ['--co-key', co1.priv]);
+  const b = readBundle();
+  delete b.members['proof-cosignatures'];
+  delete b.members['sbom-cosignatures'];
+  writeFileSync(g.bundlePath, JSON.stringify(b));
+  const v = verifyBundle(paths.art, g.bundlePath, main.pub, [
+    '--cosigner-key', co1.pub,
+    '--min-cosigners', '1',
+  ]);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'PROOF_INVALID');
+});
+
+test('包模式策略：违规 -> POLICY_VIOLATION；通过 -> policyStatus PASS', () => {
+  const k = keygen(paths.keys);
+  const g = generateBundle(paths.art, k.priv, paths.out);
+  const bad = writePolicy({ policyVersion: '1.0', maxFileCount: 0 }, 'policy-bad.json');
+  const v1 = verifyBundle(paths.art, g.bundlePath, k.pub, ['--policy', bad]);
+  assert.equal(v1.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(v1.stderr.details.violations, [{ rule: 'max-file-count', observed: 4 }]);
+
+  const good = writePolicy({ policyVersion: '1.0', maxFileCount: 4, requireSbom: true }, 'policy-good.json');
+  const v2 = verifyBundle(paths.art, g.bundlePath, k.pub, ['--policy', good]);
+  assert.equal(v2.code, 0, JSON.stringify(v2.stderr));
+  assert.equal(v2.stdout.policyStatus, 'PASS');
 });
