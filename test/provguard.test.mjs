@@ -1,10 +1,10 @@
 // Prov Guard 端到端测试：以子进程方式驱动 provguard.mjs CLI。
 // 运行：node --test
 import { spawnSync } from 'node:child_process';
-import { sign as cryptoSign, createPrivateKey, createHash } from 'node:crypto';
+import { sign as cryptoSign, createPrivateKey, createPublicKey, createHash, generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -770,6 +770,395 @@ test('--policy 缺少路径 -> USAGE_ERROR', () => {
   ]);
   assert.equal(v.code, 1);
   assert.equal(v.stderr.errorCode, 'USAGE_ERROR');
+});
+
+// ---------------------------------------------------------------------------
+// 策略签名（policy-sign；verify --policy-signature/--policy-key）
+// ---------------------------------------------------------------------------
+
+function setupSignedPolicy(policyObj = { policyVersion: '1.0', maxFileCount: 10 }) {
+  const main = keygen(paths.keys);
+  const policyKey = keygen(join(root, 'pkeys'));
+  generate(paths.art, main.priv, paths.out);
+  const policyPath = writePolicy(policyObj, 'signed-policy.json');
+  const sigPath = join(root, 'signed-policy.json.sig');
+  const s = run([
+    'policy-sign',
+    '--policy', policyPath,
+    '--key', policyKey.priv,
+    '--signature', sigPath,
+  ]);
+  assert.equal(s.code, 0, JSON.stringify(s.stderr));
+  return { main, policyKey, policyPath, sigPath, signed: s.stdout };
+}
+
+function verifySignedPolicy(setup, { overrides = {} } = {}) {
+  const { main, policyKey, policyPath, sigPath } = setup;
+  return run([
+    'verify',
+    '--artifact', overrides.artifact ?? paths.art,
+    '--proof', overrides.proof ?? join(paths.out, 'proof.json'),
+    '--signature', overrides.signature ?? join(paths.out, 'proof.json.sig'),
+    '--key', overrides.key ?? main.pub,
+    '--policy', overrides.policy ?? policyPath,
+    '--policy-signature', overrides.policySignature ?? sigPath,
+    '--policy-key', overrides.policyKey ?? policyKey.pub,
+  ]);
+}
+
+test('policy-sign：成功输出 POLICY_SIGNED、路径与签名公钥指纹，签名为 Base64 加换行', () => {
+  const setup = setupSignedPolicy();
+  assert.equal(setup.signed.status, 'POLICY_SIGNED');
+  assert.equal(setup.signed.policyPath, resolve(setup.policyPath));
+  assert.equal(setup.signed.signaturePath, resolve(setup.sigPath));
+  assert.match(setup.signed.policySignerFingerprint, /^[0-9a-f]{64}$/);
+  const sigText = readFileSync(setup.sigPath, 'utf8');
+  assert.match(sigText, /^[A-Za-z0-9+/=]+\n$/);
+  assert.equal(Buffer.from(sigText.trim(), 'base64').length, 64);
+  // 指纹与策略公钥一致（私钥不改写、可继续使用）。
+  const pub = createPublicKey(readFileSync(setup.policyKey.pub));
+  const expected = createHash('sha256')
+    .update(pub.export({ type: 'spki', format: 'der' }))
+    .digest('hex');
+  assert.equal(setup.signed.policySignerFingerprint, expected);
+});
+
+test('policy-sign：不改写策略文件（内容与字节保持原样）', () => {
+  const main = keygen(paths.keys);
+  const policyKey = keygen(join(root, 'pkeys'));
+  generate(paths.art, main.priv, paths.out);
+  // 使用非规范缩进/字段顺序的策略字节，签名后必须原样保留。
+  const policyPath = join(root, 'raw-policy.json');
+  const raw = '{"maxFileCount": 10,  "policyVersion" : "1.0"}\n';
+  writeFileSync(policyPath, raw);
+  const sigPath = join(root, 'raw-policy.json.sig');
+  const s = run(['policy-sign', '--policy', policyPath, '--key', policyKey.priv, '--signature', sigPath]);
+  assert.equal(s.code, 0, JSON.stringify(s.stderr));
+  assert.equal(readFileSync(policyPath, 'utf8'), raw);
+});
+
+test('policy-sign：重复生成逐字节一致（确定性）', () => {
+  const setup = setupSignedPolicy();
+  const sig1 = readFileSync(setup.sigPath);
+  const sigPath2 = join(root, 'signed-policy-2.json.sig');
+  const s2 = run([
+    'policy-sign',
+    '--policy', setup.policyPath,
+    '--key', setup.policyKey.priv,
+    '--signature', sigPath2,
+  ]);
+  assert.equal(s2.code, 0);
+  assert.deepEqual(readFileSync(sigPath2), sig1);
+});
+
+test('policy-sign：缺参数 -> USAGE_ERROR', () => {
+  const setup = setupSignedPolicy();
+  const cases = [
+    ['policy-sign', '--key', setup.policyKey.priv, '--signature', join(root, 'x.sig')],
+    ['policy-sign', '--policy', setup.policyPath, '--signature', join(root, 'x.sig')],
+    ['policy-sign', '--policy', setup.policyPath, '--key', setup.policyKey.priv],
+    ['policy-sign'],
+  ];
+  for (const args of cases) {
+    const r = run(args);
+    assert.equal(r.code, 1, args.join(' '));
+    assert.equal(r.stderr.errorCode, 'USAGE_ERROR', args.join(' '));
+  }
+});
+
+test('policy-sign：策略缺失/非法、私钥缺失/无法解析 -> 对应错误码', () => {
+  const setup = setupSignedPolicy();
+  const missing = run([
+    'policy-sign', '--policy', join(root, 'nope.json'),
+    '--key', setup.policyKey.priv, '--signature', join(root, 'x.sig'),
+  ]);
+  assert.equal(missing.stderr.errorCode, 'INPUT_NOT_FOUND');
+
+  const badPolicyPath = writePolicy('{broken', 'broken-policy.json');
+  const badPolicy = run([
+    'policy-sign', '--policy', badPolicyPath,
+    '--key', setup.policyKey.priv, '--signature', join(root, 'x.sig'),
+  ]);
+  assert.equal(badPolicy.code, 1);
+  assert.equal(badPolicy.stderr.errorCode, 'POLICY_INVALID');
+
+  const keyMissing = run([
+    'policy-sign', '--policy', setup.policyPath,
+    '--key', join(root, 'nope.pem'), '--signature', join(root, 'x.sig'),
+  ]);
+  assert.equal(keyMissing.stderr.errorCode, 'INPUT_NOT_FOUND');
+
+  const badKeyPath = join(root, 'not-a-key.pem');
+  writeFileSync(badKeyPath, 'not a key');
+  const badKey = run([
+    'policy-sign', '--policy', setup.policyPath,
+    '--key', badKeyPath, '--signature', join(root, 'x.sig'),
+  ]);
+  assert.equal(badKey.code, 1);
+  assert.equal(badKey.stderr.errorCode, 'KEY_NOT_FOUND');
+});
+
+test('policy-sign：非 Ed25519 私钥 -> KEY_NOT_FOUND', () => {
+  const setup = setupSignedPolicy();
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const rsaPath = join(root, 'rsa.private.pem');
+  writeFileSync(rsaPath, privateKey.export({ type: 'pkcs8', format: 'pem' }));
+  const r = run([
+    'policy-sign', '--policy', setup.policyPath,
+    '--key', rsaPath, '--signature', join(root, 'x.sig'),
+  ]);
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr.errorCode, 'KEY_NOT_FOUND');
+});
+
+test('policy-sign：签名文件不可写 -> PERMISSION_DENIED（策略与私钥不改动）', () => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+  const setup = setupSignedPolicy();
+  const blockedDir = join(root, 'readonly-dir');
+  mkdirSync(blockedDir);
+  chmodSync(blockedDir, 0o500);
+  try {
+    const target = join(blockedDir, 'policy.json.sig');
+    const r = run([
+      'policy-sign', '--policy', setup.policyPath,
+      '--key', setup.policyKey.priv, '--signature', target,
+    ]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stderr.errorCode, 'PERMISSION_DENIED');
+    assert.ok(!existsSync(target));
+  } finally {
+    chmodSync(blockedDir, 0o755);
+  }
+});
+
+test('verify：策略签名往返成功，输出 policyStatus=PASS 与 policySignerFingerprint', () => {
+  const setup = setupSignedPolicy();
+  const v = verifySignedPolicy(setup);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.policyStatus, 'PASS');
+  assert.equal(v.stdout.policySignerFingerprint, setup.signed.policySignerFingerprint);
+});
+
+test('verify：未启用策略签名时 --policy 行为不变（无 policySignerFingerprint）', () => {
+  const main = keygen(paths.keys);
+  generate(paths.art, main.priv, paths.out);
+  const policyPath = writePolicy({ policyVersion: '1.0' });
+  const v = run([
+    'verify',
+    '--artifact', paths.art,
+    '--proof', join(paths.out, 'proof.json'),
+    '--signature', join(paths.out, 'proof.json.sig'),
+    '--key', main.pub,
+    '--policy', policyPath,
+  ]);
+  assert.equal(v.code, 0);
+  assert.equal(v.stdout.policyStatus, 'PASS');
+  assert.ok(!('policySignerFingerprint' in v.stdout));
+});
+
+test('verify：非规范排版的策略按规范字节验签仍通过', () => {
+  const main = keygen(paths.keys);
+  const policyKey = keygen(join(root, 'pkeys'));
+  generate(paths.art, main.priv, paths.out);
+  // 字段顺序不同、缩进不同，但解析后与签名输入同属一个策略。
+  const policyPath = join(root, 'noncanonical.json');
+  writeFileSync(policyPath, '{"maxFileCount": 10, "policyVersion": "1.0"}');
+  const sigPath = join(root, 'noncanonical.json.sig');
+  const s = run(['policy-sign', '--policy', policyPath, '--key', policyKey.priv, '--signature', sigPath]);
+  assert.equal(s.code, 0, JSON.stringify(s.stderr));
+  const v = run([
+    'verify',
+    '--artifact', paths.art,
+    '--proof', join(paths.out, 'proof.json'),
+    '--signature', join(paths.out, 'proof.json.sig'),
+    '--key', main.pub,
+    '--policy', policyPath,
+    '--policy-signature', sigPath,
+    '--policy-key', policyKey.pub,
+  ]);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.policySignerFingerprint, s.stdout.policySignerFingerprint);
+});
+
+test('verify：策略被改动 -> SIGNATURE_INVALID（POLICY_INVALID/VIOLATION 不触发）', () => {
+  const setup = setupSignedPolicy();
+  const tamperedPath = join(root, 'tampered-policy.json');
+  writeFileSync(tamperedPath, JSON.stringify({ policyVersion: '1.0', maxFileCount: 999 }));
+  const v = verifySignedPolicy(setup, { overrides: { policy: tamperedPath } });
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('verify：错误策略公钥（另一密钥对）-> SIGNATURE_INVALID', () => {
+  const setup = setupSignedPolicy();
+  const other = keygen(paths.keys2);
+  const v = verifySignedPolicy(setup, { overrides: { policyKey: other.pub } });
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('verify：策略签名非 Base64 / 长度非法 -> SIGNATURE_INVALID', () => {
+  const setup = setupSignedPolicy();
+  const badB64 = join(root, 'bad-policy.sig');
+  writeFileSync(badB64, '!!! not base64 !!!');
+  const v1 = verifySignedPolicy(setup, { overrides: { policySignature: badB64 } });
+  assert.equal(v1.code, 1);
+  assert.equal(v1.stderr.errorCode, 'SIGNATURE_INVALID');
+
+  const shortSig = join(root, 'short-policy.sig');
+  writeFileSync(shortSig, Buffer.from('too-short').toString('base64'));
+  const v2 = verifySignedPolicy(setup, { overrides: { policySignature: shortSig } });
+  assert.equal(v2.code, 1);
+  assert.equal(v2.stderr.errorCode, 'SIGNATURE_INVALID');
+});
+
+test('verify：策略签名/公钥缺失 -> INPUT_NOT_FOUND；不可读 -> PERMISSION_DENIED；公钥无法解析 -> KEY_NOT_FOUND', () => {
+  const setup = setupSignedPolicy();
+  const v1 = verifySignedPolicy(setup, {
+    overrides: { policySignature: join(root, 'nope.sig') },
+  });
+  assert.equal(v1.stderr.errorCode, 'INPUT_NOT_FOUND');
+  const v2 = verifySignedPolicy(setup, {
+    overrides: { policyKey: join(root, 'nope.pem') },
+  });
+  assert.equal(v2.stderr.errorCode, 'INPUT_NOT_FOUND');
+
+  const badKey = join(root, 'bad-policy-key.pem');
+  writeFileSync(badKey, 'not a key');
+  const v3 = verifySignedPolicy(setup, { overrides: { policyKey: badKey } });
+  assert.equal(v3.code, 1);
+  assert.equal(v3.stderr.errorCode, 'KEY_NOT_FOUND');
+
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+  chmodSync(setup.sigPath, 0o000);
+  try {
+    const v4 = verifySignedPolicy(setup);
+    assert.equal(v4.code, 1);
+    assert.equal(v4.stderr.errorCode, 'PERMISSION_DENIED');
+  } finally {
+    chmodSync(setup.sigPath, 0o644);
+  }
+});
+
+test('verify：策略非法优先于签名问题 -> POLICY_INVALID', () => {
+  const setup = setupSignedPolicy();
+  const badPolicyPath = writePolicy('{broken', 'broken-verify-policy.json');
+  const v1 = verifySignedPolicy(setup, { overrides: { policy: badPolicyPath } });
+  assert.equal(v1.code, 1);
+  assert.equal(v1.stderr.errorCode, 'POLICY_INVALID');
+
+  // 同时签名文件也损坏，仍报 POLICY_INVALID。
+  const badSig = join(root, 'bad-sig-too.sig');
+  writeFileSync(badSig, '!!!');
+  const v2 = verifySignedPolicy(setup, {
+    overrides: { policy: badPolicyPath, policySignature: badSig },
+  });
+  assert.equal(v2.stderr.errorCode, 'POLICY_INVALID');
+});
+
+test('verify：签名通过后策略内容仍可违规 -> POLICY_VIOLATION 且保留排序', () => {
+  const main = keygen(paths.keys);
+  const policyKey = keygen(join(root, 'pkeys'));
+  generate(paths.art, main.priv, paths.out);
+  const proof = readProof();
+  const policyPath = writePolicy({
+    policyVersion: '1.0',
+    proofNotBefore: '2099-01-01T00:00:00Z',
+    allowedKeyFingerprints: ['a'.repeat(64)],
+    requireSbom: true,
+    maxFileCount: 0,
+    maxSize: 0,
+  }, 'strict-signed-policy.json');
+  const sigPath = join(root, 'strict-signed-policy.json.sig');
+  const s = run(['policy-sign', '--policy', policyPath, '--key', policyKey.priv, '--signature', sigPath]);
+  assert.equal(s.code, 0, JSON.stringify(s.stderr));
+  const v = run([
+    'verify',
+    '--artifact', paths.art,
+    '--proof', join(paths.out, 'proof.json'),
+    '--signature', join(paths.out, 'proof.json.sig'),
+    '--key', main.pub,
+    '--policy', policyPath,
+    '--policy-signature', sigPath,
+    '--policy-key', policyKey.pub,
+  ]);
+  assert.equal(v.code, 1);
+  assert.equal(v.stderr.errorCode, 'POLICY_VIOLATION');
+  assert.deepEqual(
+    v.stderr.details.violations.map((x) => x.rule),
+    ['proof-not-before', 'allowed-key-fingerprints', 'require-sbom', 'max-file-count', 'max-size'],
+  );
+  assert.equal(proof.files.length >= 1, true);
+});
+
+test('verify：证明/产物阶段失败优先于策略签名，不检查策略签名', () => {
+  const setup = setupSignedPolicy();
+  const k2 = keygen(paths.keys2);
+
+  // 错误主公钥 -> KEY_NOT_FOUND（来自证明验签阶段，而非策略阶段）。
+  const v1 = verifySignedPolicy(setup, { overrides: { key: k2.pub } });
+  assert.equal(v1.code, 1);
+  assert.equal(v1.stderr.errorCode, 'KEY_NOT_FOUND');
+
+  // 产物被篡改 -> INTEGRITY_MISMATCH。
+  writeFileSync(join(paths.art, 'a.txt'), 'CHANGED\n');
+  const v2 = verifySignedPolicy(setup);
+  assert.equal(v2.code, 1);
+  assert.equal(v2.stderr.errorCode, 'INTEGRITY_MISMATCH');
+});
+
+test('verify：策略签名参数必须与 --policy 成对/同时出现 -> USAGE_ERROR', () => {
+  const main = keygen(paths.keys);
+  const policyKey = keygen(join(root, 'pkeys'));
+  generate(paths.art, main.priv, paths.out);
+  const policyPath = writePolicy({ policyVersion: '1.0' });
+  const sigPath = join(root, 'p.sig');
+  const base = [
+    'verify',
+    '--artifact', paths.art,
+    '--proof', join(paths.out, 'proof.json'),
+    '--signature', join(paths.out, 'proof.json.sig'),
+    '--key', main.pub,
+  ];
+  const cases = [
+    [...base, '--policy', policyPath, '--policy-signature', sigPath], // 只给签名
+    [...base, '--policy', policyPath, '--policy-key', policyKey.pub], // 只给公钥
+    [...base, '--policy-signature', sigPath, '--policy-key', policyKey.pub], // 无 --policy
+  ];
+  for (const args of cases) {
+    const r = run(args);
+    assert.equal(r.code, 1, args.join(' '));
+    assert.equal(r.stderr.errorCode, 'USAGE_ERROR', args.join(' '));
+  }
+});
+
+test('verify --bundle：签名策略往返成功并输出 policySignerFingerprint', () => {
+  const main = keygen(paths.keys);
+  const policyKey = keygen(join(root, 'pkeys'));
+  const g = run([
+    'generate', '--artifact', paths.art, '--key', main.priv, '--out', paths.out, '--bundle',
+  ]);
+  assert.equal(g.code, 0, JSON.stringify(g.stderr));
+  const bundlePath = g.stdout.bundlePath;
+  const policyPath = writePolicy({ policyVersion: '1.0', requireSbom: true }, 'bundle-policy.json');
+  const sigPath = join(root, 'bundle-policy.json.sig');
+  const s = run(['policy-sign', '--policy', policyPath, '--key', policyKey.priv, '--signature', sigPath]);
+  assert.equal(s.code, 0, JSON.stringify(s.stderr));
+  const v = run([
+    'verify',
+    '--artifact', paths.art,
+    '--bundle', bundlePath,
+    '--key', main.pub,
+    '--policy', policyPath,
+    '--policy-signature', sigPath,
+    '--policy-key', policyKey.pub,
+  ]);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'VERIFIED');
+  assert.equal(v.stdout.policyStatus, 'PASS');
+  assert.equal(v.stdout.policySignerFingerprint, s.stdout.policySignerFingerprint);
+  assert.match(v.stdout.sbomDigest, /^[0-9a-f]{64}$/);
 });
 
 // ---------------------------------------------------------------------------

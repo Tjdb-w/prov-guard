@@ -15,6 +15,9 @@
 - SBOM 纳入签名保护：`proof.json` 记录 `sbomDigest`，`sbom.json.sig` 对 SBOM 规范字节单独签名，防止证明有效而 `sbom.json` 被替换；
 - 证明验证：签名校验 + 逐文件完整性比对，覆盖字节改动、文件新增与删除；
 - 可选验证策略（`--policy`）：时间窗口、签名密钥指纹白名单、强制 SBOM、文件数与总大小上限；
+- 可选策略签名（`policy-sign`）：用 Ed25519 私钥对策略的稳定 JSON 字节生成独立签名，
+  `verify` 以 `--policy-signature` + `--policy-key` 确认策略来自指定密钥（而非仅信任路径），
+  通过后输出 `policySignerFingerprint`；
 - 可选多方共签：`generate --co-key` 附加共签私钥（证明版本升为 1.1 并声明共签者指纹，
   额外输出 `proof.cosignatures.json` / `sbom.cosignatures.json`）；
   `verify --cosignatures/--cosigner-key/--min-cosigners` 校验共签并输出 `cosignerCount`；
@@ -128,12 +131,14 @@ node provguard.mjs verify \
   --key <公钥.pem> \
   [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \
   [--cosignatures <目录> --cosigner-key <公钥.pem> ... --min-cosigners <n>] \
-  [--policy <policy.json>]
+  [--policy <policy.json> \
+   --policy-signature <policy.json.sig> --policy-key <策略公钥.pem>]
 ```
 
 验证顺序：检查输入存在且可读 → 解析公钥 → 解析并校验证明结构 → 校验签名格式 →
 比对签名公钥指纹并验签 → 重新扫描产物并逐项（摘要、文件名、大小、清单条目）比对 →
-（可选）SBOM 校验 →（可选）共签校验 →（可选）策略校验。
+（可选）SBOM 校验 →（可选）共签校验 →（可选）策略加载与校验、（可选）策略签名校验
+→ 策略规则评估。
 
 `--sbom` 与 `--sbom-signature` 为成对可选参数：只给一者返回 `USAGE_ERROR`；二者齐全时，
 在上述检查之后继续校验 `sbom.json` 的字段、相对路径与 SHA-256 格式，重算 SBOM 摘要并与
@@ -152,7 +157,8 @@ node provguard.mjs verify \
 全部通过后输出 `VERIFIED` 并增加 `cosignerCount`；之后才执行可选策略。
 
 成功时 stdout 输出（启用 SBOM 校验时额外包含 `sbomDigest`；启用共签校验时额外包含
-`cosignerCount`；提供 `--policy` 且通过时额外包含 `"policyStatus": "PASS"`）：
+`cosignerCount`；提供 `--policy` 且通过时额外包含 `"policyStatus": "PASS"`；
+同时提供策略签名时再额外包含 `policySignerFingerprint`）：
 
 ```json
 {
@@ -171,7 +177,8 @@ node provguard.mjs verify \
   --bundle <proof.bundle.json> \
   --key <公钥.pem> \
   [--cosigner-key <公钥.pem> ... --min-cosigners <n>] \
-  [--policy <policy.json>]
+  [--policy <policy.json> \
+   --policy-signature <policy.json.sig> --policy-key <策略公钥.pem>]
 ```
 
 - `--bundle` 与 `--proof`、`--signature`、`--sbom`、`--sbom-signature`、`--cosignatures`
@@ -229,6 +236,55 @@ node provguard.mjs verify \
 `allowed-key-fingerprints` / `require-sbom`（`observed` 为 `"absent"`）/
 `max-file-count` / `max-size`。
 
+### 5. 策略签名（可选 `policy-sign`；`--policy-signature` / `--policy-key`）
+
+`--policy` 只按路径加载策略；策略签名把策略内容绑定到指定 Ed25519 密钥，验证时确认
+策略确实来自持有对应私钥的一方，而不仅是信任文件路径。
+
+```
+node provguard.mjs policy-sign --policy <policy.json> --key <私钥.pem> --signature <policy.json.sig>
+```
+
+- 用 `--key`（Ed25519 私钥 PEM）对 `--policy` 的**稳定 JSON 字节**签名：键名排序、
+  两空格缩进、末尾换行的 UTF-8（策略磁盘排版非规范时，按解析结果重新规范化后签名）。
+- 签名写入 `--signature`，沿用既有签名文件约定：Base64 加单行换行；**不改写**策略、
+  私钥或任何证明产物；同一策略与私钥重复生成逐字节一致。
+- 签名前先按与验证相同的规则严格校验策略：策略缺失 `INPUT_NOT_FOUND`、不可读
+  `PERMISSION_DENIED`、JSON/未知字段/取值/`policyVersion` 非法 `POLICY_INVALID`；
+  私钥无法解析或非 Ed25519 为 `KEY_NOT_FOUND`；签名文件所在目录不可写等为
+  `PERMISSION_DENIED`。
+
+成功时 stdout 输出：
+
+```json
+{
+  "status": "POLICY_SIGNED",
+  "policyPath": "<策略绝对路径>",
+  "signaturePath": "<签名绝对路径>",
+  "policySignerFingerprint": "<签名公钥的 SHA-256 指纹>"
+}
+```
+
+验证时（独立文件模式与 `--bundle` 模式相同）追加：
+
+```
+--policy <policy.json> --policy-signature <policy.json.sig> --policy-key <策略公钥.pem>
+```
+
+- `--policy-signature` 与 `--policy-key` 必须**成对**出现，且必须与 `--policy`
+  **同时**提供；缺值、只给一者或不提供 `--policy` 均返回 `USAGE_ERROR`。
+- 检查时机：在证明签名、产物完整性、SBOM 与共签全部通过，且策略文件自身通过严格
+  校验（`POLICY_INVALID`）**之后**，才校验策略签名与策略公钥，最后才评估策略规则：
+  - 策略签名文件或策略公钥缺失为 `INPUT_NOT_FOUND`，不可读为 `PERMISSION_DENIED`；
+  - 策略公钥无法解析或不是 Ed25519 为 `KEY_NOT_FOUND`；
+  - 策略合法但签名不是合法 Base64、长度不为 64 字节、与策略内容不符，或与策略公钥
+    不对应，均为 `SIGNATURE_INVALID`；
+  - 签名通过但策略规则不满足仍为 `POLICY_VIOLATION`，违规内容与排序规则不变。
+- 通过后成功 JSON 在 `policyStatus` 之外额外包含 `policySignerFingerprint`
+  （策略签名公钥的 SPKI SHA-256）。
+- 不提供这两个参数时，`--policy` 的行为、输出与错误码完全不变；未启用策略签名的
+  命令、`generate`、`--bundle` 生成、SBOM、共签与符号链接行为均不受影响。
+
 ## 错误码
 
 任何失败都以**非零退出码**结束，并在 stderr 输出机器可读 JSON：
@@ -244,16 +300,18 @@ node provguard.mjs verify \
 
 | 错误码 | 触发条件 |
 | --- | --- |
-| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥、策略文件、共签清单（`proof.cosignatures.json` / `sbom.cosignatures.json`）、证明分发包路径不存在 |
-| `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足），包括策略文件与共签清单不可读 |
-| `KEY_NOT_FOUND` | 公钥/私钥无法解析、不是 Ed25519，验证时提供的公钥与证明记录的签名密钥不一致（错误公钥），或共签公钥未在证明声明的共签者集合中 |
+| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥、策略文件、策略签名文件与策略公钥、共签清单（`proof.cosignatures.json` / `sbom.cosignatures.json`）、证明分发包路径不存在 |
+| `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足），包括策略文件、策略签名文件与共签清单不可读，以及 `policy-sign` 签名文件不可写 |
+| `KEY_NOT_FOUND` | 公钥/私钥无法解析、不是 Ed25519，验证时提供的公钥与证明记录的签名密钥不一致（错误公钥），共签公钥未在证明声明的共签者集合中，或策略公钥无法解析/不是 Ed25519（含 `policy-sign` 的私钥） |
 | `PROOF_INVALID` | 证明、SBOM 或共签清单的 JSON 不可解析、结构或摘要非法；签名文件不是合法 Base64 或长度非法；共签清单含主签名指纹、指纹重复、与证明声明的签名者集合不一致；分发包 JSON 不可解析、`bundleVersion` 非 `"1.0"`、成员缺失或多余、成员 Base64 非法、字节长度或 SHA-256 与内容不符、共签成员与证明声明不一致 |
-| `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏）；共签签名与内容不匹配，或有效共签数量不足 `--min-cosigners` |
+| `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏）；共签签名与内容不匹配，或有效共签数量不足 `--min-cosigners`；策略签名不是合法 Base64、长度不为 64 字节、与策略内容不符或与 `--policy-key` 不对应 |
 | `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增/删除/重命名，或 `sbom.json`（或共签校验时复算的 SBOM）与证明记录的 `sbomDigest` 不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch`） |
-| `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter` |
+| `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter`；`verify` 与 `policy-sign` 使用同一套策略校验 |
 | `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小排序列出全部违规，每项含 `rule` 与 `observed` |
 | `SYMLINK_INVALID` | 目录扫描发现危险符号链接：形成回路（`details.reason` 为 `cycle`）或目标越出产物根目录（`details.reason` 为 `outside-root`）；`details.path` 为链接的相对路径。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败 |
-| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量，`--bundle` 与独立文件参数（`--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures`）混用，包模式下 `--cosigner-key` 与 `--min-cosigners` 未同时提供 |
+| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量，`--bundle` 与独立文件参数（`--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures`）混用，包模式下 `--cosigner-key` 与 `--min-cosigners` 未同时提供，`policy-sign` 缺少
+`--policy`/`--key`/`--signature`，或 `--policy-signature` 与 `--policy-key` 只给一者、
+未与 `--policy` 同时提供 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
 
@@ -274,6 +332,16 @@ node provguard.mjs verify   --artifact dist/ \
   --bundle attestation/proof.bundle.json \
   --key keys/provguard.public.pem \
   --policy policy.json
+# 为策略签名并在验证时要求策略来自指定密钥：
+node provguard.mjs policy-sign --policy policy.json \
+  --key keys/provguard.private.pem --signature policy.json.sig
+node provguard.mjs verify   --artifact dist/ \
+  --proof attestation/proof.json \
+  --signature attestation/proof.json.sig \
+  --key keys/provguard.public.pem \
+  --policy policy.json \
+  --policy-signature policy.json.sig \
+  --policy-key keys/provguard.public.pem
 ```
 
 ## 测试
@@ -294,4 +362,10 @@ generate 失败前不写证明、verify 扫描阶段报错，以及安全内部�
 分发包测试覆盖 `--bundle` 生成（独立文件保留、成员字节与原文件一致、成员排序与
 重复生成稳定性）、`verify --bundle` 往返（含共签与策略组合）、参数互斥与缺参、
 包不可解析、版本非法、成员缺失/多余、Base64/长度/SHA-256 不符、包内证明篡改、
-错误公钥、产物篡改与共签成员缺失。
+错误公钥、产物篡改与共签成员缺失；
+策略签名测试覆盖 `policy-sign` 往返（`POLICY_SIGNED`、路径与密钥指纹、Base64 格式）、
+不改写策略、重复生成确定性、缺参、策略缺失/非法、私钥缺失/无法解析/非 Ed25519、
+签名文件不可写，以及 `verify` 下签名策略通过与 `policySignerFingerprint` 输出、
+非规范排版按规范字节验签、策略改动、错误策略公钥、签名 Base64/长度非法、
+签名文件与公钥缺失/不可读、公钥无法解析、非法策略优先、违规排序、前置阶段错误优先、
+参数不成对/缺少 `--policy` 的 `USAGE_ERROR`，以及 `--bundle` 模式组合。
