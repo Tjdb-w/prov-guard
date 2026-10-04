@@ -23,6 +23,10 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url';
 
 export const PROOF_VERSION = '1.0';
+// 启用多方共签（--co-key）时证明版本升为 1.1；缺省仍写 1.0，旧证明可验证。
+export const COSIGN_PROOF_VERSION = '1.1';
+// 共签清单（proof.cosignatures.json / sbom.cosignatures.json）的结构版本。
+export const COSIGN_SCHEMA_VERSION = '1.0';
 
 // ---------------------------------------------------------------------------
 // 错误类型：携带机器可读错误码，CLI 边界统一转换为非零退出。
@@ -353,14 +357,17 @@ export async function keygen({ keyDir, name = 'provguard' }) {
 // generate
 // ---------------------------------------------------------------------------
 
-export async function generate({ artifact, key, out }) {
-  // 输入检查：产物与私钥必须存在且可读。
+export async function generate({ artifact, key, out, coKeys = [] }) {
+  // 输入检查：产物、主私钥与全部共签私钥必须存在且可读。
   const artifactAbs = resolve(artifact);
   const keyAbs = resolve(key);
-  for (const [p, label] of [
+  const coKeyAbsList = coKeys.map((p) => resolve(p));
+  const inputs = [
     [artifactAbs, '产物'],
     [keyAbs, '私钥'],
-  ]) {
+    ...coKeyAbsList.map((p) => [p, '共签私钥']),
+  ];
+  for (const [p, label] of inputs) {
     try {
       await access(p, fsConstants.R_OK);
     } catch (err) {
@@ -394,6 +401,27 @@ export async function generate({ artifact, key, out }) {
   const signingPublicKey = createPublicKey(privateKey);
   const signerKeyFingerprint = keyFingerprint(signingPublicKey);
 
+  // 共签私钥：按指纹判重，与主密钥相同或彼此重复属于用法错误（USAGE_ERROR）。
+  // 共签者按指纹升序排列，保证清单与证明声明字节级确定。
+  const cosignMode = coKeyAbsList.length > 0;
+  const coSigners = [];
+  {
+    const seen = new Set([signerKeyFingerprint.toLowerCase()]);
+    for (const p of coKeyAbsList) {
+      const coPriv = readPrivateKey(p);
+      const fp = keyFingerprint(createPublicKey(coPriv));
+      if (seen.has(fp.toLowerCase())) {
+        throw new ProvError(
+          ERROR_CODES.USAGE_ERROR,
+          `共签私钥重复或与主密钥相同: ${p}`,
+        );
+      }
+      seen.add(fp.toLowerCase());
+      coSigners.push({ privateKey: coPriv, fingerprint: fp });
+    }
+    coSigners.sort((a, b) => (a.fingerprint < b.fingerprint ? -1 : a.fingerprint > b.fingerprint ? 1 : 0));
+  }
+
   const sbom = await buildSbom(artifactAbs, outReal);
   const artifactDigest = computeArtifactDigest(sbom);
 
@@ -403,7 +431,7 @@ export async function generate({ artifact, key, out }) {
   const sbomDigest = sha256Hex(sbomCanonical);
 
   const proof = {
-    proofVersion: PROOF_VERSION,
+    proofVersion: cosignMode ? COSIGN_PROOF_VERSION : PROOF_VERSION,
     artifactName: basename(artifactAbs),
     artifactDigest,
     fileName: basename(artifactAbs),
@@ -413,6 +441,10 @@ export async function generate({ artifact, key, out }) {
     sbomDigest,
     files: sbom.files,
   };
+  // 共签模式：证明声明按指纹升序去重的共签者集合（不含主签名者）。
+  if (cosignMode) {
+    proof.cosignerKeyFingerprints = coSigners.map((c) => c.fingerprint);
+  }
   // 稳定字段顺序：proof 先按既定顺序构造，再整体排序输出。
   const proofJson = stableJsonStringify(proof) + '\n';
   const sbomJson = sbomCanonical + '\n';
@@ -429,16 +461,45 @@ export async function generate({ artifact, key, out }) {
   const sbomPath = join(outReal, 'sbom.json');
   const sigPath = join(outReal, 'proof.json.sig');
   const sbomSigPath = join(outReal, 'sbom.json.sig');
+  // 共签清单：主签名者与各共签者签同一组证明规范字节，各共签者另签 SBOM 规范字节。
+  // 两份清单均携带 artifactDigest / sbomDigest 绑定与按指纹升序的 signers，
+  // 签名者集合与证明声明的 cosignerKeyFingerprints 一致。无 --co-key 时不创建。
+  const proofCosigPath = cosignMode ? join(outReal, 'proof.cosignatures.json') : null;
+  const sbomCosigPath = cosignMode ? join(outReal, 'sbom.cosignatures.json') : null;
   try {
     await atomicWrite(proofPath, proofJson);
     await atomicWrite(sbomPath, sbomJson);
     await atomicWrite(sigPath, signatureB64);
     await atomicWrite(sbomSigPath, sbomSignatureB64);
+    if (cosignMode) {
+      const proofBytes = Buffer.from(proofJson.trimEnd(), 'utf8');
+      const sbomBytes = Buffer.from(sbomCanonical, 'utf8');
+      const proofCosign = {
+        schemaVersion: COSIGN_SCHEMA_VERSION,
+        artifactDigest,
+        sbomDigest,
+        signers: coSigners.map((c) => ({
+          keyFingerprint: c.fingerprint,
+          signature: cryptoSign(null, proofBytes, c.privateKey).toString('base64'),
+        })),
+      };
+      const sbomCosign = {
+        schemaVersion: COSIGN_SCHEMA_VERSION,
+        artifactDigest,
+        sbomDigest,
+        signers: coSigners.map((c) => ({
+          keyFingerprint: c.fingerprint,
+          signature: cryptoSign(null, sbomBytes, c.privateKey).toString('base64'),
+        })),
+      };
+      await atomicWrite(proofCosigPath, `${stableJsonStringify(proofCosign)}\n`);
+      await atomicWrite(sbomCosigPath, `${stableJsonStringify(sbomCosign)}\n`);
+    }
   } catch (err) {
     throw wrapFsError(err, '写入证明产物');
   }
 
-  return {
+  const result = {
     proofPath,
     sbomPath,
     signaturePath: sigPath,
@@ -446,8 +507,14 @@ export async function generate({ artifact, key, out }) {
     artifactDigest,
     sbomDigest,
     fileCount: sbom.files.length,
-    proofVersion: PROOF_VERSION,
+    proofVersion: proof.proofVersion,
   };
+  if (cosignMode) {
+    result.proofCosignaturesPath = proofCosigPath;
+    result.sbomCosignaturesPath = sbomCosigPath;
+    result.cosignerCount = coSigners.length;
+  }
+  return result;
 }
 
 // 同目录临时文件 + rename，避免半成品证明文件留在输出目录。
@@ -475,6 +542,9 @@ export async function verify({
   sbom: sbomPath,
   sbomSignature: sbomSigPath,
   policy: policyPath,
+  cosignatures: cosigDir,
+  cosignerKeys = [],
+  minCosigners,
 }) {
   const artifactAbs = resolve(artifact);
   const proofAbs = resolve(proofPath);
@@ -488,6 +558,28 @@ export async function verify({
   }
   const sbomAbs = sbomMode ? resolve(sbomPath) : null;
   const sbomSigAbs = sbomMode ? resolve(sbomSigPath) : null;
+
+  // --cosignatures、--cosigner-key 与 --min-cosigners 必须同时提供；
+  // min 必须是正整数且不超过提供的共签公钥数量。
+  const cosignParts = [cosigDir !== undefined, cosignerKeys.length > 0, minCosigners !== undefined];
+  const cosignMode = cosignParts.some(Boolean);
+  if (cosignMode && !cosignParts.every(Boolean)) {
+    throw new ProvError(
+      ERROR_CODES.USAGE_ERROR,
+      '--cosignatures、--cosigner-key 与 --min-cosigners 必须同时提供',
+    );
+  }
+  if (cosignMode) {
+    if (!Number.isSafeInteger(minCosigners) || minCosigners < 1) {
+      throw new ProvError(ERROR_CODES.USAGE_ERROR, '--min-cosigners 必须是正整数');
+    }
+    if (minCosigners > cosignerKeys.length) {
+      throw new ProvError(
+        ERROR_CODES.USAGE_ERROR,
+        `--min-cosigners 超过提供的共签公钥数量（${minCosigners} > ${cosignerKeys.length}）`,
+      );
+    }
+  }
 
   // 1) 所有输入必须存在且可读。
   const inputs = [
@@ -603,6 +695,21 @@ export async function verify({
     sbomDigest = await verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey });
   }
 
+  // 7.5) 共签模式：在证明、产物完整性、可选 SBOM 全部通过后校验共签，
+  //      全部通过后才进入策略。产物或 SBOM 变化优先报 INTEGRITY_MISMATCH。
+  let cosignerCount;
+  if (cosignMode) {
+    cosignerCount = await verifyCosignatures({
+      cosigDir,
+      cosignerKeyPaths: cosignerKeys,
+      minCosigners,
+      proof,
+      canonicalProof,
+      currentSbom,
+      mainFingerprint: providedFingerprint,
+    });
+  }
+
   // 8) 可选策略：仅在签名、完整性、可选 SBOM 校验全部通过后加载并执行。
   //    策略文件自身缺失/不可读/非法按其错误码返回（INPUT_NOT_FOUND /
   //    PERMISSION_DENIED / POLICY_INVALID）；内容违规为 POLICY_VIOLATION。
@@ -627,6 +734,7 @@ export async function verify({
     fileCount: currentSbom.files.length,
   };
   if (sbomMode) result.sbomDigest = sbomDigest;
+  if (cosignMode) result.cosignerCount = cosignerCount;
   if (policyPath !== undefined) result.policyStatus = policyStatus;
   return result;
 }
@@ -701,6 +809,186 @@ async function verifySbom({ sbomAbs, sbomSigAbs, proof, publicKey }) {
   return recomputed;
 }
 
+// ---------------------------------------------------------------------------
+// 多方共签（proof.cosignatures.json / sbom.cosignatures.json）
+// ---------------------------------------------------------------------------
+
+// 共签清单结构校验：返回错误消息字符串，合法返回 null。
+// 含主签名者指纹、指纹重复、字段缺失或格式非法均为 PROOF_INVALID。
+function validateCosigManifest(manifest, mainFingerprint) {
+  if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return '共签清单顶层必须是 JSON 对象';
+  }
+  if (manifest.schemaVersion !== COSIGN_SCHEMA_VERSION) {
+    return `共签清单 schemaVersion 缺失或不受支持（期望 ${COSIGN_SCHEMA_VERSION}）`;
+  }
+  for (const k of ['artifactDigest', 'sbomDigest']) {
+    if (typeof manifest[k] !== 'string' || !/^[0-9a-f]{64}$/i.test(manifest[k])) {
+      return `共签清单字段缺失或非法: ${k}`;
+    }
+  }
+  if (!Array.isArray(manifest.signers)) return '共签清单字段缺失或类型非法: signers';
+  const seen = new Set();
+  let prev = null;
+  for (const s of manifest.signers) {
+    if (s === null || typeof s !== 'object' || Array.isArray(s)) {
+      return '共签清单签名者条目必须是对象';
+    }
+    if (typeof s.keyFingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(s.keyFingerprint)) {
+      return '共签清单签名者 keyFingerprint 缺失或非法';
+    }
+    const fp = s.keyFingerprint.toLowerCase();
+    if (fp === mainFingerprint.toLowerCase()) return '共签清单包含主签名者指纹';
+    if (seen.has(fp)) return `共签清单签名者指纹重复: ${fp}`;
+    seen.add(fp);
+    if (prev !== null && fp < prev) return '共签清单签名者未按指纹升序排列';
+    prev = fp;
+    if (typeof s.signature !== 'string') return '共签清单签名者 signature 缺失或类型非法';
+    const b64 = s.signature.replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64) || b64.length === 0) {
+      return '共签清单签名不是合法的 Base64 内容';
+    }
+    if (Buffer.from(b64, 'base64').length !== 64) {
+      return '共签清单签名长度非法（Ed25519 应为 64 字节）';
+    }
+  }
+  return null;
+}
+
+async function readCosigManifest(path, mainFingerprint) {
+  let text;
+  try {
+    text = await readFile(path, 'utf8');
+  } catch (err) {
+    throw wrapFsError(err, '读取共签清单');
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(text);
+  } catch {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, `共签清单不是合法的 JSON: ${path}`);
+  }
+  const error = validateCosigManifest(manifest, mainFingerprint);
+  if (error) throw new ProvError(ERROR_CODES.PROOF_INVALID, error);
+  return manifest;
+}
+
+// 共签校验：清单结构 -> 摘要绑定 -> 签名者集合与证明声明一致 ->
+// 公钥对应声明共签者 -> 逐签验签 -> 有效数量达到 min。
+async function verifyCosignatures({
+  cosigDir,
+  cosignerKeyPaths,
+  minCosigners,
+  proof,
+  canonicalProof,
+  currentSbom,
+  mainFingerprint,
+}) {
+  const dirAbs = resolve(cosigDir);
+  // 清单缺失或不可读 -> INPUT_NOT_FOUND / PERMISSION_DENIED。
+  const proofCosig = await readCosigManifest(join(dirAbs, 'proof.cosignatures.json'), mainFingerprint);
+  const sbomCosig = await readCosigManifest(join(dirAbs, 'sbom.cosignatures.json'), mainFingerprint);
+
+  // 清单的摘要绑定必须与证明一致，否则清单不属于本次证明。
+  for (const m of [proofCosig, sbomCosig]) {
+    if (
+      m.artifactDigest.toLowerCase() !== proof.artifactDigest.toLowerCase() ||
+      m.sbomDigest.toLowerCase() !== proof.sbomDigest.toLowerCase()
+    ) {
+      throw new ProvError(
+        ERROR_CODES.PROOF_INVALID,
+        '共签清单的 artifactDigest/sbomDigest 与证明不一致',
+      );
+    }
+  }
+
+  // 证明声明的共签者集合（1.0 证明无此字段，视为空集）。
+  const declared =
+    proof.cosignerKeyFingerprints === undefined
+      ? []
+      : proof.cosignerKeyFingerprints.map((fp) => fp.toLowerCase());
+  const declaredSorted = [...declared].sort();
+  const setEquals = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+  const proofSigners = proofCosig.signers.map((s) => s.keyFingerprint.toLowerCase());
+  const sbomSigners = sbomCosig.signers.map((s) => s.keyFingerprint.toLowerCase());
+  if (!setEquals(proofSigners, declaredSorted) || !setEquals(sbomSigners, declaredSorted)) {
+    throw new ProvError(
+      ERROR_CODES.PROOF_INVALID,
+      '共签清单的签名者集合与证明声明的 cosignerKeyFingerprints 不一致',
+    );
+  }
+
+  // SBOM 规范字节来自完整性校验通过的当前扫描；其摘要必须与证明记录一致，
+  // 否则视为 SBOM 变化，优先报 INTEGRITY_MISMATCH。
+  if (typeof proof.sbomDigest !== 'string' || !/^[0-9a-f]{64}$/i.test(proof.sbomDigest)) {
+    throw new ProvError(ERROR_CODES.PROOF_INVALID, '证明缺少合法的 sbomDigest 字段');
+  }
+  const canonicalSbom = stableJsonStringify(currentSbom);
+  if (sha256Hex(canonicalSbom).toLowerCase() !== proof.sbomDigest.toLowerCase()) {
+    throw new ProvError(
+      ERROR_CODES.INTEGRITY_MISMATCH,
+      '当前产物的 SBOM 摘要与证明记录的 sbomDigest 不一致（SBOM 可能已变化）',
+      { mismatches: [{ path: 'sbom.json', kind: 'content-modified' }] },
+    );
+  }
+
+  // 读取共签公钥并按指纹去重；无法解析/非 Ed25519 归 KEY_NOT_FOUND。
+  const seenKeys = new Set();
+  const cosignerKeys = [];
+  for (const p of cosignerKeyPaths) {
+    const pk = readPublicKey(resolve(p));
+    const fp = keyFingerprint(pk).toLowerCase();
+    if (seenKeys.has(fp)) continue;
+    seenKeys.add(fp);
+    cosignerKeys.push({ publicKey: pk, fingerprint: fp });
+  }
+
+  // 每个提供的公钥都必须对应证明声明的共签者，否则为未声明/错误公钥。
+  const declaredSet = new Set(declaredSorted);
+  for (const { fingerprint } of cosignerKeys) {
+    if (!declaredSet.has(fingerprint)) {
+      throw new ProvError(
+        ERROR_CODES.KEY_NOT_FOUND,
+        '提供的共签公钥未在证明声明的共签者集合中（未声明或错误公钥）',
+        { providedKeyFingerprint: fingerprint },
+      );
+    }
+  }
+
+  // 逐签验签：证明规范字节与 SBOM 规范字节都必须验签成功。
+  const proofSigByFp = new Map(proofCosig.signers.map((s) => [s.keyFingerprint.toLowerCase(), s.signature]));
+  const sbomSigByFp = new Map(sbomCosig.signers.map((s) => [s.keyFingerprint.toLowerCase(), s.signature]));
+  const proofBytes = Buffer.from(canonicalProof, 'utf8');
+  const sbomBytes = Buffer.from(canonicalSbom, 'utf8');
+  let valid = 0;
+  for (const { publicKey, fingerprint } of cosignerKeys) {
+    const proofSig = Buffer.from(proofSigByFp.get(fingerprint).replace(/\s+/g, ''), 'base64');
+    const sbomSig = Buffer.from(sbomSigByFp.get(fingerprint).replace(/\s+/g, ''), 'base64');
+    let ok = false;
+    try {
+      ok =
+        cryptoVerify(null, proofBytes, publicKey, proofSig) &&
+        cryptoVerify(null, sbomBytes, publicKey, sbomSig);
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      throw new ProvError(
+        ERROR_CODES.SIGNATURE_INVALID,
+        `共签签名与证明或 SBOM 内容不匹配（指纹 ${fingerprint}）`,
+      );
+    }
+    valid += 1;
+  }
+  if (valid < minCosigners) {
+    throw new ProvError(
+      ERROR_CODES.SIGNATURE_INVALID,
+      `有效共签数量不足（需要 ${minCosigners}，实际 ${valid}）`,
+    );
+  }
+  return valid;
+}
+
 function inferExcludeDir(proofAbs, artifactAbs) {
   // 证明文件所在目录若位于产物之内，则将其视为生成时的输出目录予以排除。
   const proofDir = dirname(proofAbs);
@@ -736,6 +1024,28 @@ function validateProof(proof) {
     return '证明字段缺失或类型非法: size';
   }
   if (!Array.isArray(proof.files)) return '证明字段缺失或类型非法: files';
+  // 共签声明（1.1 证明）：可选；出现时必须是按指纹升序去重的合法指纹数组，
+  // 且不得包含主签名者指纹。1.0 旧证明无此字段，不受影响。
+  if (proof.cosignerKeyFingerprints !== undefined) {
+    if (!Array.isArray(proof.cosignerKeyFingerprints)) {
+      return '证明字段类型非法: cosignerKeyFingerprints';
+    }
+    const seen = new Set();
+    let prev = null;
+    for (const fp of proof.cosignerKeyFingerprints) {
+      if (typeof fp !== 'string' || !/^[0-9a-f]{64}$/i.test(fp)) {
+        return '证明中的 cosignerKeyFingerprints 存在非法的 SHA-256 十六进制指纹';
+      }
+      const norm = fp.toLowerCase();
+      if (norm === proof.signerKeyFingerprint.toLowerCase()) {
+        return '证明的共签者集合包含主签名者指纹';
+      }
+      if (seen.has(norm)) return `证明的共签者指纹重复: ${norm}`;
+      seen.add(norm);
+      if (prev !== null && norm < prev) return '证明的共签者指纹未按升序排列';
+      prev = norm;
+    }
+  }
   return validateFileEntries(proof.files);
 }
 
@@ -1029,6 +1339,9 @@ function evaluatePolicy(policy, proof, sbomMode) {
 // CLI
 // ---------------------------------------------------------------------------
 
+// 可重复出现的参数：取值收集为数组，其余参数保持单值覆盖语义。
+const REPEATABLE_ARGS = new Set(['co-key', 'cosigner-key']);
+
 function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i += 1) {
@@ -1036,11 +1349,14 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith('--')) {
-        args[key] = true;
+      const hasValue = next !== undefined && !next.startsWith('--');
+      const value = hasValue ? next : true;
+      if (hasValue) i += 1;
+      if (REPEATABLE_ARGS.has(key)) {
+        if (args[key] === undefined) args[key] = [];
+        args[key].push(value);
       } else {
-        args[key] = next;
-        i += 1;
+        args[key] = value;
       }
     } else {
       args._.push(a);
@@ -1055,13 +1371,17 @@ function usage() {
     '',
     '用法:',
     '  provguard keygen   --key-dir <dir> [--name <prefix>]',
-    '  provguard generate --artifact <path> --key <private.pem> --out <dir>',
+    '  provguard generate --artifact <path> --key <private.pem> --out <dir> \\',
+    '                      [--co-key <private.pem> ...]',
     '  provguard verify   --artifact <path> --proof <proof.json> \\',
     '                      --signature <proof.json.sig> --key <public.pem> \\',
     '                      [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \\',
+    '                      [--cosignatures <dir> --cosigner-key <public.pem> ... \\',
+    '                       --min-cosigners <n>] \\',
     '                      [--policy <policy.json>]',
     '',
     'generate 输出: proof.json / proof.json.sig / sbom.json / sbom.json.sig',
+    '共签模式追加: proof.cosignatures.json / sbom.cosignatures.json',
     '成功状态: VERIFIED；错误码见 README。',
   ].join('\n');
 }
@@ -1105,19 +1425,28 @@ async function main(argv) {
           `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}`,
         );
       }
-      const r = await generate({ artifact: args.artifact, key: args.key, out: args.out });
-      process.stdout.write(
-        `${stableJsonStringify({
-          status: 'GENERATED',
-          proofVersion: r.proofVersion,
-          artifactDigest: r.artifactDigest,
-          fileCount: r.fileCount,
-          proofPath: r.proofPath,
-          sbomPath: r.sbomPath,
-          signaturePath: r.signaturePath,
-          sbomSignaturePath: r.sbomSignaturePath,
-        })}\n`,
-      );
+      // --co-key 可重复；出现时必须带私钥路径。
+      const coKeys = args['co-key'] ?? [];
+      if (coKeys.some((v) => typeof v !== 'string')) {
+        throw new ProvError(ERROR_CODES.USAGE_ERROR, '--co-key 需要提供私钥文件路径');
+      }
+      const r = await generate({ artifact: args.artifact, key: args.key, out: args.out, coKeys });
+      const out = {
+        status: 'GENERATED',
+        proofVersion: r.proofVersion,
+        artifactDigest: r.artifactDigest,
+        fileCount: r.fileCount,
+        proofPath: r.proofPath,
+        sbomPath: r.sbomPath,
+        signaturePath: r.signaturePath,
+        sbomSignaturePath: r.sbomSignaturePath,
+      };
+      if (r.proofCosignaturesPath !== undefined) {
+        out.proofCosignaturesPath = r.proofCosignaturesPath;
+        out.sbomCosignaturesPath = r.sbomCosignaturesPath;
+        out.cosignerCount = r.cosignerCount;
+      }
+      process.stdout.write(`${stableJsonStringify(out)}\n`);
       return 0;
     }
 
@@ -1140,6 +1469,41 @@ async function main(argv) {
       if (hasPolicy && typeof args.policy !== 'string') {
         throw new ProvError(ERROR_CODES.USAGE_ERROR, '--policy 需要提供策略文件路径');
       }
+      // 共签参数组：--cosignatures、--cosigner-key（可重复）、--min-cosigners 必须同时提供。
+      const cosigDirRaw = args.cosignatures;
+      const cosignerKeysRaw = args['cosigner-key'] ?? [];
+      const minRaw = args['min-cosigners'];
+      const anyCosign =
+        cosigDirRaw !== undefined || cosignerKeysRaw.length > 0 || minRaw !== undefined;
+      const cosign = {};
+      if (anyCosign) {
+        if (
+          typeof cosigDirRaw !== 'string' ||
+          cosignerKeysRaw.length === 0 ||
+          typeof minRaw !== 'string'
+        ) {
+          throw new ProvError(
+            ERROR_CODES.USAGE_ERROR,
+            '--cosignatures、--cosigner-key 与 --min-cosigners 必须同时提供有效取值',
+          );
+        }
+        if (cosignerKeysRaw.some((v) => typeof v !== 'string')) {
+          throw new ProvError(ERROR_CODES.USAGE_ERROR, '--cosigner-key 需要提供公钥文件路径');
+        }
+        if (!/^\d+$/.test(minRaw) || Number(minRaw) < 1) {
+          throw new ProvError(ERROR_CODES.USAGE_ERROR, '--min-cosigners 必须是正整数');
+        }
+        const minCosigners = Number(minRaw);
+        if (minCosigners > cosignerKeysRaw.length) {
+          throw new ProvError(
+            ERROR_CODES.USAGE_ERROR,
+            `--min-cosigners 超过提供的共签公钥数量（${minCosigners} > ${cosignerKeysRaw.length}）`,
+          );
+        }
+        cosign.cosignatures = cosigDirRaw;
+        cosign.cosignerKeys = cosignerKeysRaw;
+        cosign.minCosigners = minCosigners;
+      }
       const r = await verify({
         artifact: args.artifact,
         proof: args.proof,
@@ -1148,6 +1512,7 @@ async function main(argv) {
         sbom: hasSbom ? args.sbom : undefined,
         sbomSignature: hasSbomSig ? args['sbom-signature'] : undefined,
         policy: hasPolicy ? args.policy : undefined,
+        ...cosign,
       });
       process.stdout.write(`${stableJsonStringify(r)}\n`);
       return 0;

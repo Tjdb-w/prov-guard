@@ -15,6 +15,9 @@
 - SBOM 纳入签名保护：`proof.json` 记录 `sbomDigest`，`sbom.json.sig` 对 SBOM 规范字节单独签名，防止证明有效而 `sbom.json` 被替换；
 - 证明验证：签名校验 + 逐文件完整性比对，覆盖字节改动、文件新增与删除；
 - 可选验证策略（`--policy`）：时间窗口、签名密钥指纹白名单、强制 SBOM、文件数与总大小上限；
+- 可选多方共签（`--co-key` / `--cosignatures` / `--cosigner-key` / `--min-cosigners`）：
+  主签名者与各共签者分别签同一证明规范字节，各共签者另签 SBOM 规范字节；
+  验证时可要求有效共签数量达到阈值；
 - 目录扫描的符号链接安全处理：指向产物根目录内部文件/目录的链接按链接路径记录目标内容；
   形成回路或越出产物根目录的链接以 `SYMLINK_INVALID` 失败，不会继续递归或读取外部内容；
 - 机器可读的错误码与非零退出码。
@@ -58,21 +61,31 @@ node provguard.mjs keygen --key-dir <目录> [--name <前缀>]
 ### 2. 生成证明与物料清单
 
 ```
-node provguard.mjs generate --artifact <产物路径> --key <私钥.pem> --out <输出目录>
+node provguard.mjs generate --artifact <产物路径> --key <私钥.pem> --out <输出目录> \
+  [--co-key <共签私钥.pem> ...]
 ```
 
 - `--artifact`：单个文件或目录；目录会被递归扫描。
-- `--key`：Ed25519 私钥 PEM。
+- `--key`：Ed25519 私钥 PEM（主签名者，生成证明与签名）。
 - `--out`：输出目录（不存在会创建）；若该目录位于产物内部，会从扫描结果中排除自身。
+- `--co-key`：可选、可重复的共签私钥 PEM。重复指纹或与主密钥相同返回 `USAGE_ERROR`。
 
 输出目录内容：
 
 | 文件 | 说明 |
 | --- | --- |
-| `proof.json` | 证明：证明版本、产物名、稳定产物摘要、总大小、生成时间、签名公钥指纹、SBOM 摘要（`sbomDigest`）、逐文件清单 |
+| `proof.json` | 证明：证明版本、产物名、稳定产物摘要、总大小、生成时间、签名公钥指纹、SBOM 摘要（`sbomDigest`）、逐文件清单；共签模式下版本为 `1.1` 并增加按指纹升序去重的 `cosignerKeyFingerprints` |
 | `proof.json.sig` | 对证明规范字节的 Ed25519 签名（Base64），可单独保存与分发 |
 | `sbom.json` | 软件物料清单：`schemaVersion` / `artifactName` / `rootType`，并按相对路径列出每个文件的 `path` / `sha256` / `size` / `type` |
 | `sbom.json.sig` | 对 `sbom.json` 去尾换行后的 UTF-8 规范 JSON 的 Ed25519 签名（Base64 加换行） |
+| `proof.cosignatures.json` | **仅共签模式**：各共签者对证明规范字节的签名清单 |
+| `sbom.cosignatures.json` | **仅共签模式**：各共签者对 SBOM 规范字节的签名清单 |
+
+共签清单结构：`schemaVersion`（`"1.0"`）、`artifactDigest`、`sbomDigest`、按指纹升序的
+`signers`（每项含 `keyFingerprint` 与 Base64 Ed25519 `signature`）；签名者集合与证明声明的
+`cosignerKeyFingerprints` 一致（不含主签名者）。不提供 `--co-key` 时不创建这两份清单，
+`proofVersion` 保持 `1.0`，全部既有行为不变。共签模式下扫描、摘要、SBOM 与 `generatedAt`
+的语义与缺省完全一致。
 
 `sbomDigest` 是对 SBOM 规范字节（去尾换行的稳定 JSON）的 SHA-256，随证明一起签名；
 `sbom.json.sig` 再对同一组字节单独签名，因此替换 `sbom.json` 无法在不暴露的情况下通过验证。
@@ -89,20 +102,36 @@ node provguard.mjs verify \
   --signature <proof.json.sig> \
   --key <公钥.pem> \
   [--sbom <sbom.json> --sbom-signature <sbom.json.sig>] \
+  [--cosignatures <目录> --cosigner-key <公钥.pem> ... --min-cosigners <n>] \
   [--policy <policy.json>]
 ```
 
 验证顺序：检查输入存在且可读 → 解析公钥 → 解析并校验证明结构 → 校验签名格式 →
 比对签名公钥指纹并验签 → 重新扫描产物并逐项（摘要、文件名、大小、清单条目）比对 →
-（可选）SBOM 校验 →（可选）策略校验。
+（可选）SBOM 校验 →（可选）共签校验 →（可选）策略校验。
 
 `--sbom` 与 `--sbom-signature` 为成对可选参数：只给一者返回 `USAGE_ERROR`；二者齐全时，
 在上述检查之后继续校验 `sbom.json` 的字段、相对路径与 SHA-256 格式，重算 SBOM 摘要并与
 证明中的 `sbomDigest` 比对，验证 `sbom.json.sig` 签名，最后确认 SBOM 清单、证明清单与
 当前扫描逐项一致。缺省不提供这两个参数时，验证行为与之前完全一致。
 
-成功时 stdout 输出（启用 SBOM 校验时额外包含 `sbomDigest`；提供 `--policy` 且通过时
-额外包含 `"policyStatus": "PASS"`）：
+`--cosignatures`、`--cosigner-key`（可重复）、`--min-cosigners` 三个参数必须同时提供，
+缺少任一返回 `USAGE_ERROR`；`--min-cosigners` 必须是正整数且不超过提供的共签公钥数量，
+否则同样返回 `USAGE_ERROR`。共签校验在产物完整性与可选 SBOM 校验全部通过后进行：
+
+1. 读取 `<目录>/proof.cosignatures.json` 与 `<目录>/sbom.cosignatures.json`
+   （缺失/不可读返回 `INPUT_NOT_FOUND` / `PERMISSION_DENIED`）；
+2. 校验清单结构：字段齐全、格式合法、签名者按指纹升序、无重复指纹、不含主签名者指纹，
+   且摘要绑定与签名者集合同证明声明一致 —— 违反任一返回 `PROOF_INVALID`；
+3. 每个 `--cosigner-key` 必须对应证明声明的共签者，否则返回 `KEY_NOT_FOUND`；
+4. 逐一验证共签者对证明规范字节与 SBOM 规范字节的签名，不匹配返回 `SIGNATURE_INVALID`；
+5. 有效共签数量（按指纹去重后）达到 `--min-cosigners` 方可通过，不足返回 `SIGNATURE_INVALID`。
+
+产物或 SBOM 发生变化时优先返回 `INTEGRITY_MISMATCH`（完整性校验在共签校验之前）。
+共签全部通过后成功输出增加 `cosignerCount`（有效共签数量）。
+
+成功时 stdout 输出（启用 SBOM 校验时额外包含 `sbomDigest`；启用共签校验时额外包含
+`cosignerCount`；提供 `--policy` 且通过时额外包含 `"policyStatus": "PASS"`）：
 
 ```json
 {
@@ -174,16 +203,16 @@ node provguard.mjs verify \
 
 | 错误码 | 触发条件 |
 | --- | --- |
-| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥、策略文件路径不存在 |
-| `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足），包括策略文件不可读 |
-| `KEY_NOT_FOUND` | 公钥/私钥无法解析、不是 Ed25519，或验证时提供的公钥与证明记录的签名密钥不一致（错误公钥） |
-| `PROOF_INVALID` | 证明或 SBOM 的 JSON 不可解析、结构或摘要非法；签名文件不是合法 Base64 或长度非法 |
-| `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏） |
+| `INPUT_NOT_FOUND` | 产物、证明、签名、SBOM 或其签名、公钥、策略文件、共签清单路径不存在 |
+| `PERMISSION_DENIED` | 输入不可读或输出不可写（权限不足），包括策略文件与共签清单不可读 |
+| `KEY_NOT_FOUND` | 公钥/私钥无法解析、不是 Ed25519，验证时提供的公钥与证明记录的签名密钥不一致（错误公钥），或共签公钥未在证明声明的共签者集合中 |
+| `PROOF_INVALID` | 证明、SBOM 或共签清单的 JSON 不可解析、结构或摘要非法；签名文件不是合法 Base64 或长度非法；共签清单含主签名者指纹、指纹重复或与证明声明不一致 |
+| `SIGNATURE_INVALID` | 公钥正确但签名与证明/SBOM 内容不匹配（内容被改动或签名损坏）；共签签名不匹配或有效共签数量不足 `--min-cosigners` |
 | `INTEGRITY_MISMATCH` | 验签通过后，产物相对证明存在字节改动、文件新增/删除/重命名，或 `sbom.json` 与证明记录的 `sbomDigest` 不一致；`details.mismatches` 给出差异路径与类型（`content-modified` / `size-mismatch` / `added` / `missing` / `artifact-digest-mismatch` / `artifact-name-mismatch`） |
 | `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`、指纹白名单为空数组、或 `proofNotBefore` 晚于 `proofNotAfter` |
 | `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小排序列出全部违规，每项含 `rule` 与 `observed` |
 | `SYMLINK_INVALID` | 目录扫描发现危险符号链接：形成回路（`details.reason` 为 `cycle`）或目标越出产物根目录（`details.reason` 为 `outside-root`）；`details.path` 为链接的相对路径。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败 |
-| `USAGE_ERROR` | 缺少必填参数、未知子命令，或 `--sbom` 与 `--sbom-signature` 只给一者 |
+| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签参数组（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）缺少任一、`--min-cosigners` 非正整数或超过共签公钥数量 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
 
@@ -191,13 +220,18 @@ node provguard.mjs verify \
 
 ```
 node provguard.mjs keygen --key-dir keys
-node provguard.mjs generate --artifact dist/ --key keys/provguard.private.pem --out attestation/
+node provguard.mjs keygen --key-dir keys-alice --name alice
+node provguard.mjs generate --artifact dist/ --key keys/provguard.private.pem \
+  --co-key keys-alice/alice.private.pem --out attestation/
 node provguard.mjs verify   --artifact dist/ \
   --proof attestation/proof.json \
   --signature attestation/proof.json.sig \
   --key keys/provguard.public.pem \
   --sbom attestation/sbom.json \
   --sbom-signature attestation/sbom.json.sig \
+  --cosignatures attestation/ \
+  --cosigner-key keys-alice/alice.public.pem \
+  --min-cosigners 1 \
   --policy policy.json
 ```
 
@@ -212,4 +246,7 @@ node --test
 策略测试覆盖通过（PASS）、闭区间边界、指纹大小写不敏感、`requireSbom`、上限边界、
 违规排序、`generated-at-invalid`、策略文件各类非法情形、缺失/不可读以及篡改优先；
 符号链接测试覆盖越出根目录（outside-root）、指回祖先与互相成环（cycle）、ELOOP、
-generate 失败前不写证明、verify 扫描阶段报错，以及安全内部链接的记录与稳定性。
+generate 失败前不写证明、verify 扫描阶段报错，以及安全内部链接的记录与稳定性；
+共签测试覆盖共签往返与清单结构、缺省不共签行为不变、重复/同主钥 `--co-key`、
+共签参数组缺失与阈值非法、min 阈值、未声明公钥、签名篡改、清单缺失、
+清单含主签名指纹/集合不一致、产物变化优先、与 SBOM 和策略的组合及错误优先级。
