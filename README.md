@@ -25,6 +25,8 @@
   `--policy-key` 确认策略来自指定密钥，通过后输出 `policySignerFingerprint`；
 - 可选证明分发包：`generate --bundle` 在输出目录照常写出全部独立文件，并额外生成
   `proof.bundle.json`（单文件分发包）；`verify --bundle` 直接从包验证，独立文件入口保留；
+- 独立发布门禁 `gate`：根据产物、自包含签名证明、软件物料清单与发布策略判定产物是否
+  可发布，输出确定性 JSON 报告（`allowed` / `denied`），不改动既有命令的默认行为；
 - 目录扫描的符号链接安全处理：指向产物根目录内部文件/目录的链接按链接路径记录目标内容；
   形成回路或越出产物根目录的链接以 `SYMLINK_INVALID` 失败，不会继续递归或读取外部内容；
 - 机器可读的错误码与非零退出码。
@@ -307,6 +309,82 @@ JSON 对象，`policyVersion` 仅接受 `"1.0"` 与 `"1.1"`；仅允许以下字
 `required-file-digest-mismatch`（`observed` 为实际摘要）/
 `forbidden-file-present`（`observed` 为路径）。
 
+### 6. 发布门禁（`gate`，独立入口）
+
+```
+node provguard.mjs gate \
+  --artifact <产物路径> \
+  --proof <proof.json> \
+  --sbom <sbom.json> \
+  --policy <policy.json>
+```
+
+`gate` 是独立的发布判定入口：不改动既有命令的默认行为、文件格式、输出与退出码，
+只读取本地公开文件（**不读取任何私钥或凭证**），成功时不写出任何业务数据文件。
+执行流水线：读取并解析四类输入 → 校验策略 → 验证证明签名与产物摘要、建立 SBOM 与
+产物的对应关系 → 将 SBOM 与策略逐条件比对 → 在 stdout 输出确定性 JSON 报告。
+
+**门禁证明（`--proof`）** 为自包含签名证明（公钥内嵌，无需额外密钥文件）：
+
+```json
+{
+  "artifactDigest": "<64 位十六进制，与 verify 相同的产物摘要>",
+  "source": "<构建来源引用，如仓库与提交>",
+  "signer": "<签名主体/证书身份>",
+  "publicKey": "<Ed25519 公钥 PEM>",
+  "signature": "<对去除 signature 字段后的稳定 JSON 字节的 Base64 签名>"
+}
+```
+
+**门禁 SBOM（`--sbom`）**：
+
+```json
+{
+  "artifactDigest": "<64 位十六进制，须与产物实际摘要一致以建立对应关系>",
+  "packages": [ { "name": "...", "version": "...", "license": "..." } ]
+}
+```
+
+`packages` 每项必须含非空 `name` 与 `license`，`version` 可选。
+
+**发布策略（`--policy`）** 为非空 JSON 对象，只允许以下条件字段（可只包含其中一部分，
+但至少一项；空策略、未知条件类型或值不符合条件定义均为 `PolicyError`）：
+
+| 字段 | 类型 | 报告条件标识 | 说明 |
+| --- | --- | --- | --- |
+| `allowedSources` | 非空字符串数组 | `source` | 允许的构建来源引用（精确匹配证明的 `source`） |
+| `allowedSigners` | 非空字符串数组 | `signer` | 允许的签名主体/证书身份（精确匹配证明的 `signer`） |
+| `artifactDigest` | 64 位十六进制 | `digest` | 期望的产物摘要（大小写不敏感） |
+| `allowedPackages` | 非空字符串数组 | `packages` | SBOM 中每个包名都必须命中 |
+| `allowedLicenses` | 非空字符串数组 | `licenses` | SBOM 中每个许可证都必须命中 |
+
+**报告**：stdout 输出确定性 JSON，对象键按固定顺序（`status`、`artifactDigest`、
+`proofSource`、`signer`、`packageCount`、`conditions`；条件条目为 `id`、`observed`、
+`result`，条件按 `source → signer → digest → packages → licenses` 排列，仅包含策略中
+出现的条件）：
+
+```json
+{
+  "status": "allowed",
+  "artifactDigest": "<已核实的产物摘要>",
+  "proofSource": "<证明中的构建来源>",
+  "signer": "<证明中的签名主体>",
+  "packageCount": 2,
+  "conditions": [
+    { "id": "source", "observed": "...", "result": "pass" }
+  ]
+}
+```
+
+**退出码与错误码**（门禁的失败都有唯一可观察结果，错误以 JSON 写 stderr）：
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 全部条件通过，stdout 输出 `allowed` 报告 |
+| `4` | 证明有效但违反许可证、来源、身份或包约束，stdout 输出 `denied` 报告（非系统错误，stderr 为空） |
+| `2` | `InputError`：路径不存在、文件不可读、JSON 语法错误、缺少必需字段或缺少必填参数；`PolicyError`：策略为空、条件类型未知或值不符合条件定义 |
+| `3` | `VerificationError`：证明签名无效、证明中的产物摘要与实际产物不一致、证明或 SBOM 无法建立与产物的对应关系 |
+
 ## 错误码
 
 任何失败都以**非零退出码**结束，并在 stderr 输出机器可读 JSON：
@@ -387,4 +465,9 @@ generate 失败前不写证明、verify 扫描阶段报错，以及安全内部�
 策略签名测试覆盖 `policy-sign` 成功输出与字段、重复签名逐字节一致、不改写输入、
 verify 独立文件与分发包两种模式往返、错误签名密钥/篡改策略/错误公钥、签名
 Base64 与长度非法、各路径缺失与不可读、非 Ed25519 密钥、参数不成对或缺 `--policy`、
-策略违规仍返回 `POLICY_VIOLATION`，以及证明/产物篡改优先于策略签名校验。
+策略违规仍返回 `POLICY_VIOLATION`，以及证明/产物篡改优先于策略签名校验；
+发布门禁测试覆盖 allowed/denied 往返与退出码（0/4）、报告固定键顺序与逐条件
+标识/观测值/判定、部分条件策略、五类条件各自的违规判定、输入缺失/不可读/JSON
+语法错误/缺字段（`InputError`，退出码 2）、空策略/未知条件/非法条件值
+（`PolicyError`，退出码 2）、签名篡改/产物摘要与 SBOM 对应失败
+（`VerificationError`，退出码 3），以及门禁不写出任何业务数据文件。

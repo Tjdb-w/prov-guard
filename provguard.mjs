@@ -1766,6 +1766,289 @@ function evaluatePolicy(policy, proof, sbomMode) {
 }
 
 // ---------------------------------------------------------------------------
+// gate（发布门禁）：独立的发布判定入口，不改动既有生成/验证语义。
+//
+// 输入为四类本地公开文件（不读取任何私钥或凭证）：
+//   --artifact  产物路径（文件或目录，按既有规则重算产物摘要）
+//   --proof     自包含签名证明（JSON）：artifactDigest / source / signer /
+//               publicKey（Ed25519 PEM）/ signature（对去除 signature 字段后的
+//               稳定 JSON 字节的 Base64 签名）；公钥内嵌于证明，无需额外密钥文件
+//   --sbom      软件物料清单（JSON）：artifactDigest（绑定产物）+ packages
+//               （每项含 name / license，可选 version）
+//   --policy    发布策略（JSON，非空对象，仅允许已知条件字段）
+//
+// 流水线：读取并解析四类输入（InputError）-> 策略结构校验（PolicyError）->
+// 证明签名与产物摘要、SBOM 关联校验（VerificationError）-> 逐条件评估 ->
+// stdout 输出确定性 JSON 报告（键按固定顺序），allowed 退出 0、denied 退出 4。
+// 门禁不写出任何业务数据文件。
+// ---------------------------------------------------------------------------
+
+export const GATE_ERROR_KINDS = Object.freeze({
+  INPUT: 'InputError',
+  POLICY: 'PolicyError',
+  VERIFICATION: 'VerificationError',
+});
+
+// 门禁错误：kind 决定 stderr 错误码与退出码（InputError/PolicyError -> 2，VerificationError -> 3）。
+class GateError extends Error {
+  constructor(kind, message) {
+    super(message);
+    this.name = 'GateError';
+    this.kind = kind;
+  }
+}
+
+// 策略允许的条件字段（即报告中的条件标识来源）；其余字段一律 PolicyError。
+export const GATE_POLICY_FIELDS = Object.freeze([
+  'allowedSources',
+  'allowedSigners',
+  'artifactDigest',
+  'allowedPackages',
+  'allowedLicenses',
+]);
+
+async function readGateInput(pathAbs, label) {
+  try {
+    return await readFile(pathAbs, 'utf8');
+  } catch {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, `无法读取${label}: ${pathAbs}`);
+  }
+}
+
+function parseGateJson(text, label) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, `${label}不是合法的 JSON`);
+  }
+}
+
+// 证明结构校验：必需字段缺失或类型非法均为 InputError。
+function validateGateProof(proof) {
+  if (proof === null || typeof proof !== 'object' || Array.isArray(proof)) {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, '证明文件顶层必须是 JSON 对象');
+  }
+  for (const k of ['artifactDigest', 'source', 'signer', 'publicKey', 'signature']) {
+    if (typeof proof[k] !== 'string' || proof[k].length === 0) {
+      throw new GateError(GATE_ERROR_KINDS.INPUT, `证明缺少必需字段或类型非法: ${k}`);
+    }
+  }
+  if (!/^[0-9a-f]{64}$/i.test(proof.artifactDigest)) {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, '证明中的 artifactDigest 不是合法的 SHA-256 十六进制摘要');
+  }
+}
+
+// SBOM 结构校验：artifactDigest 与 packages（含 name/license）必需。
+function validateGateSbom(sbom) {
+  if (sbom === null || typeof sbom !== 'object' || Array.isArray(sbom)) {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, '软件物料清单顶层必须是 JSON 对象');
+  }
+  if (typeof sbom.artifactDigest !== 'string' || !/^[0-9a-f]{64}$/i.test(sbom.artifactDigest)) {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, '软件物料清单缺少合法的 artifactDigest 字段');
+  }
+  if (!Array.isArray(sbom.packages)) {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, '软件物料清单缺少必需字段或类型非法: packages');
+  }
+  for (const pkg of sbom.packages) {
+    if (pkg === null || typeof pkg !== 'object' || Array.isArray(pkg)) {
+      throw new GateError(GATE_ERROR_KINDS.INPUT, '软件物料清单 packages 条目必须是对象');
+    }
+    if (typeof pkg.name !== 'string' || pkg.name.length === 0) {
+      throw new GateError(GATE_ERROR_KINDS.INPUT, '软件物料清单 packages 条目缺少合法的 name 字段');
+    }
+    if (typeof pkg.license !== 'string' || pkg.license.length === 0) {
+      throw new GateError(GATE_ERROR_KINDS.INPUT, `软件物料清单 packages 条目缺少合法的 license 字段: ${pkg.name}`);
+    }
+    if (pkg.version !== undefined && typeof pkg.version !== 'string') {
+      throw new GateError(GATE_ERROR_KINDS.INPUT, `软件物料清单 packages 条目 version 类型非法: ${pkg.name}`);
+    }
+  }
+}
+
+// 策略结构校验：非空对象、仅已知条件字段、值符合各条件定义；违反均为 PolicyError。
+function validateGatePolicy(policy) {
+  if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new GateError(GATE_ERROR_KINDS.POLICY, '发布策略顶层必须是 JSON 对象');
+  }
+  const keys = Object.keys(policy);
+  if (keys.length === 0) {
+    throw new GateError(GATE_ERROR_KINDS.POLICY, '发布策略不能为空（至少包含一个条件）');
+  }
+  const known = new Set(GATE_POLICY_FIELDS);
+  for (const key of keys) {
+    if (!known.has(key)) {
+      throw new GateError(GATE_ERROR_KINDS.POLICY, `发布策略包含无法识别的条件类型: ${key}`);
+    }
+  }
+  for (const k of ['allowedSources', 'allowedSigners', 'allowedPackages', 'allowedLicenses']) {
+    if (policy[k] === undefined) continue;
+    if (
+      !Array.isArray(policy[k]) ||
+      policy[k].length === 0 ||
+      policy[k].some((v) => typeof v !== 'string' || v.length === 0)
+    ) {
+      throw new GateError(GATE_ERROR_KINDS.POLICY, `策略条件 ${k} 的值必须是非空字符串数组`);
+    }
+  }
+  if (
+    policy.artifactDigest !== undefined &&
+    (typeof policy.artifactDigest !== 'string' || !/^[0-9a-f]{64}$/i.test(policy.artifactDigest))
+  ) {
+    throw new GateError(GATE_ERROR_KINDS.POLICY, '策略条件 artifactDigest 的值必须是 64 位十六进制 SHA-256');
+  }
+}
+
+// 证明签名校验：公钥内嵌于证明；公钥无法解析、非 Ed25519、签名 Base64/长度非法
+// 或验签失败均为 VerificationError。
+function verifyGateProofSignature(proof) {
+  let keyObj;
+  try {
+    keyObj = createPublicKey({ key: proof.publicKey, format: 'pem' });
+  } catch {
+    throw new GateError(GATE_ERROR_KINDS.VERIFICATION, '证明中的公钥无法解析');
+  }
+  if (keyObj.asymmetricKeyType !== 'ed25519') {
+    throw new GateError(GATE_ERROR_KINDS.VERIFICATION, '证明中的公钥不是 Ed25519');
+  }
+  const sigB64 = proof.signature.replace(/\s+/g, '');
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
+    throw new GateError(GATE_ERROR_KINDS.VERIFICATION, '证明签名不是合法的 Base64 内容');
+  }
+  const sigBuf = Buffer.from(sigB64, 'base64');
+  if (sigBuf.length !== 64) {
+    throw new GateError(GATE_ERROR_KINDS.VERIFICATION, '证明签名长度非法（Ed25519 应为 64 字节）');
+  }
+  // 签名输入：去除 signature 字段后的稳定 JSON（与生成侧约定一致）。
+  const { signature: _omit, ...signed } = proof;
+  let ok = false;
+  try {
+    ok = cryptoVerify(null, Buffer.from(stableJsonStringify(signed), 'utf8'), keyObj, sigBuf);
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    throw new GateError(GATE_ERROR_KINDS.VERIFICATION, '证明签名无效（证明可能被改动，或签名/公钥不符）');
+  }
+}
+
+// 重算产物摘要；扫描失败（路径不存在、不可读、危险符号链接等）归为 InputError。
+async function gateArtifactDigest(artifactAbs) {
+  let sbom;
+  try {
+    sbom = await buildSbom(artifactAbs, null);
+  } catch (err) {
+    if (err instanceof ProvError) {
+      throw new GateError(GATE_ERROR_KINDS.INPUT, `无法读取产物: ${err.message}`);
+    }
+    throw err;
+  }
+  return computeArtifactDigest(sbom);
+}
+
+// 逐条件评估（固定顺序：source -> signer -> digest -> packages -> licenses），
+// 仅评估策略中出现的条件；每条记录标识、实际观测值与判定结果。
+function evaluateGateConditions(policy, proof, sbom, digest) {
+  const conditions = [];
+  if (policy.allowedSources !== undefined) {
+    conditions.push({
+      id: 'source',
+      observed: proof.source,
+      result: policy.allowedSources.includes(proof.source) ? 'pass' : 'fail',
+    });
+  }
+  if (policy.allowedSigners !== undefined) {
+    conditions.push({
+      id: 'signer',
+      observed: proof.signer,
+      result: policy.allowedSigners.includes(proof.signer) ? 'pass' : 'fail',
+    });
+  }
+  if (policy.artifactDigest !== undefined) {
+    conditions.push({
+      id: 'digest',
+      observed: digest,
+      result: policy.artifactDigest.toLowerCase() === digest.toLowerCase() ? 'pass' : 'fail',
+    });
+  }
+  if (policy.allowedPackages !== undefined) {
+    const names = sbom.packages.map((p) => p.name);
+    conditions.push({
+      id: 'packages',
+      observed: names,
+      result: names.every((n) => policy.allowedPackages.includes(n)) ? 'pass' : 'fail',
+    });
+  }
+  if (policy.allowedLicenses !== undefined) {
+    const licenses = [...new Set(sbom.packages.map((p) => p.license))].sort();
+    conditions.push({
+      id: 'licenses',
+      observed: licenses,
+      result: licenses.every((l) => policy.allowedLicenses.includes(l)) ? 'pass' : 'fail',
+    });
+  }
+  return conditions;
+}
+
+// 门禁主流程。返回 { report, exitCode }（allowed -> 0，denied -> 4）；
+// 失败抛出 GateError（由 CLI 边界转换为 stderr 错误码与退出码 2/3）。
+export async function gate({ artifact, proof: proofPath, sbom: sbomPath, policy: policyPath }) {
+  const artifactAbs = resolve(artifact);
+  const proofAbs = resolve(proofPath);
+  const sbomAbs = resolve(sbomPath);
+  const policyAbs = resolve(policyPath);
+
+  // 1) 读取并解析四类输入：路径不存在/不可读、JSON 语法错误、缺少必需字段 -> InputError。
+  try {
+    await access(artifactAbs, fsConstants.R_OK);
+  } catch {
+    throw new GateError(GATE_ERROR_KINDS.INPUT, `无法读取产物: ${artifactAbs}`);
+  }
+  const proof = parseGateJson(await readGateInput(proofAbs, '证明文件'), '证明文件');
+  const sbom = parseGateJson(await readGateInput(sbomAbs, '软件物料清单'), '软件物料清单');
+  const policy = parseGateJson(await readGateInput(policyAbs, '发布策略'), '发布策略');
+  validateGateProof(proof);
+  validateGateSbom(sbom);
+
+  // 2) 策略校验：空策略、未知条件类型、值不符合条件定义 -> PolicyError。
+  validateGatePolicy(policy);
+
+  // 3) 证明签名与产物摘要、SBOM 关联校验 -> VerificationError。
+  verifyGateProofSignature(proof);
+  const digest = await gateArtifactDigest(artifactAbs);
+  if (proof.artifactDigest.toLowerCase() !== digest.toLowerCase()) {
+    throw new GateError(
+      GATE_ERROR_KINDS.VERIFICATION,
+      '证明中的产物摘要与实际产物不一致（证明与产物无法对应）',
+    );
+  }
+  if (sbom.artifactDigest.toLowerCase() !== digest.toLowerCase()) {
+    throw new GateError(
+      GATE_ERROR_KINDS.VERIFICATION,
+      '软件物料清单的 artifactDigest 与实际产物不一致（SBOM 与产物无法对应）',
+    );
+  }
+
+  // 4) 逐条件评估并生成确定性报告（对象键按固定顺序构造）。
+  const conditions = evaluateGateConditions(policy, proof, sbom, digest);
+  const allowed = conditions.every((c) => c.result === 'pass');
+  const report = {
+    status: allowed ? 'allowed' : 'denied',
+    artifactDigest: digest,
+    proofSource: proof.source,
+    signer: proof.signer,
+    packageCount: sbom.packages.length,
+    conditions,
+  };
+  return { report, exitCode: allowed ? 0 : 4 };
+}
+
+// 报告序列化：对象构造顺序即固定键顺序，两空格缩进（不用 stableJsonStringify，
+// 因为报告键顺序是语义的一部分，而非按名排序）。
+function stringifyGateReport(report) {
+  return JSON.stringify(report, null, 2);
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -1816,11 +2099,14 @@ function usage() {
     '                      [--cosigner-key <public.pem> ... --min-cosigners <n>] \\',
     '                      [--policy <policy.json>] \\',
     '                      [--policy-signature <policy.json.sig> --policy-key <public.pem>]',
+    '  provguard gate     --artifact <path> --proof <proof.json> \\',
+    '                      --sbom <sbom.json> --policy <policy.json>',
     '',
     'generate 输出: proof.json / proof.json.sig / sbom.json / sbom.json.sig',
     '启用共签时额外输出: proof.cosignatures.json / sbom.cosignatures.json',
     '使用 --bundle 时额外输出: proof.bundle.json（单文件证明分发包）',
     'policy-sign 输出: policy.json.sig（策略的 Ed25519 签名，不改动策略与密钥）',
+    'gate 输出: 发布门禁报告（allowed/denied）；退出码 0=allowed 4=denied 2=输入/策略错误 3=校验失败',
     '成功状态: VERIFIED；错误码见 README。',
   ].join('\n');
 }
@@ -2038,6 +2324,39 @@ async function main(argv) {
       return 0;
     }
 
+    if (command === 'gate') {
+      // 发布门禁：独立于 verify 的判定入口。缺少必填参数视为输入缺失（InputError）。
+      const missing = ['artifact', 'proof', 'sbom', 'policy'].filter((k) => typeof args[k] !== 'string');
+      if (missing.length) {
+        process.stderr.write(
+          `${stableJsonStringify({
+            status: 'ERROR',
+            errorCode: GATE_ERROR_KINDS.INPUT,
+            message: `缺少必填参数: ${missing.map((m) => `--${m}`).join(', ')}`,
+          })}\n`,
+        );
+        return 2;
+      }
+      try {
+        const r = await gate({
+          artifact: args.artifact,
+          proof: args.proof,
+          sbom: args.sbom,
+          policy: args.policy,
+        });
+        process.stdout.write(`${stringifyGateReport(r.report)}\n`);
+        return r.exitCode;
+      } catch (err) {
+        if (err instanceof GateError) {
+          process.stderr.write(
+            `${stableJsonStringify({ status: 'ERROR', errorCode: err.kind, message: err.message })}\n`,
+          );
+          return err.kind === GATE_ERROR_KINDS.VERIFICATION ? 3 : 2;
+        }
+        throw err;
+      }
+    }
+
     throw new ProvError(ERROR_CODES.USAGE_ERROR, `未知子命令: ${command}`);
   } catch (err) {
     // stderr 仅输出机器可读 JSON；用法帮助走 stdout，避免污染错误流。
@@ -2056,4 +2375,4 @@ if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.me
   });
 }
 
-export { main, ProvError, ERROR_CODES as CODES };
+export { main, ProvError, GateError, ERROR_CODES as CODES };
