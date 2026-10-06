@@ -27,6 +27,10 @@
   `proof.bundle.json`（单文件分发包）；`verify --bundle` 直接从包验证，独立文件入口保留；
 - 目录扫描的符号链接安全处理：指向产物根目录内部文件/目录的链接按链接路径记录目标内容；
   形成回路或越出产物根目录的链接以 `SYMLINK_INVALID` 失败，不会继续递归或读取外部内容；
+- 独立发布门禁（`gate`）：仅读取本地产物、自包含签名证明、含包名与许可证的软件物料清单及
+  发布策略四类公开文件（不读取密钥或凭证，验签公钥内嵌于证明），验证签名与三方摘要对应关系后
+  逐项比对策略，在 stdout 输出确定性 JSON 报告（`allowed` 退出 0 / `denied` 退出 4），
+  `InputError`/`PolicyError` 退出 2、`VerificationError` 退出 3；
 - 机器可读的错误码与非零退出码。
 
 ## 约定
@@ -307,6 +311,145 @@ JSON 对象，`policyVersion` 仅接受 `"1.0"` 与 `"1.1"`；仅允许以下字
 `required-file-digest-mismatch`（`observed` 为实际摘要）/
 `forbidden-file-present`（`observed` 为路径）。
 
+### 6. 发布门禁（`gate`）
+
+```
+node provguard.mjs gate \
+  --artifact <产物路径> \
+  --attestation <gate.attestation.json> \
+  --sbom <gate.sbom.json> \
+  --policy <gate.policy.json>
+```
+
+`gate` 是与既有 `generate`/`verify` 相互独立的发布门禁：**不改动**任何已有命令的默认行为、
+文件格式、标准输出、退出码与异常处理；门禁本身也**不读取任何私钥或凭证**（验签公钥内嵌于
+证明），只读取四个本地公开文件，成功时只向 stdout 写报告，不额外落盘。
+
+四个参数均为必填，缺任一以 `InputError` 结束（退出码 2）：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--artifact` | 待发布产物：单个文件或目录，按与 `generate`/`verify` 相同的规则递归扫描 |
+| `--attestation` | 自包含签名证明（gate attestation），内嵌公开验签公钥 |
+| `--sbom` | 发布物料清单：文件级 SBOM 外加 `components`（包名与许可证） |
+| `--policy` | 发布策略：非空 `conditions` 数组，仅允许受支持的条件类型 |
+
+处理顺序：读取并解析四类输入 → 用证明内嵌公钥验证证明签名 → 重扫产物并核对证明记录的产物摘要
+→ 校验 SBOM 摘要并把 SBOM 清单与当前产物逐项对账 → 逐项评估策略条件 → 输出确定性 JSON 报告。
+
+#### 证明文件（`--attestation`）
+
+UTF-8 JSON 对象，`attestationVersion` 为 `"1.0"`，必需字段：
+
+```json
+{
+  "attestationVersion": "1.0",
+  "subject": {
+    "artifactName": "app",
+    "artifactDigest": "<64 位十六进制 SHA-256>",
+    "sbomDigest": "<64 位十六进制 SHA-256>"
+  },
+  "source": {
+    "repository": "https://git.example.com/team/app",
+    "reference": "refs/tags/v1.2.3"
+  },
+  "signer": {
+    "issuer": "https://oidc.example.com",
+    "subject": "ci-bot@example.com"
+  },
+  "signature": "<对去掉 signature/publicKey 后载荷规范字节的 Ed25519 Base64 签名>",
+  "publicKey": "<SPKI PEM 公钥，验签用，公开信息>",
+  "claims": {}
+}
+```
+
+- `signature` 覆盖的载荷为删除 `signature` 与 `publicKey` 两个字段后、按本工具规范 JSON
+  （键名排序、两空格缩进）序列化的字节；验签时以同一规范形式重算。
+- `claims` 为可选附加声明对象，不参与门禁判定；其余必需字段缺失或类型非法为 `InputError`。
+- 内嵌公钥无法解析或不是 Ed25519、签名不是合法 Base64、长度不是 64 字节或验签失败，均为
+  `VerificationError`（公钥是证明的组成部分，非法公钥等同证明不可信）。
+
+#### 物料清单（`--sbom`）
+
+在文件级 SBOM（`schemaVersion` 为 `"1.0"`，含 `artifactName` / `rootType` / `files`，
+条目规则与 `generate` 输出的 `sbom.json` 完全一致）之上增加 `components`：
+
+```json
+{
+  "schemaVersion": "1.0",
+  "artifactName": "app",
+  "rootType": "directory",
+  "files": [ { "path": "a.txt", "sha256": "<hex>", "size": 6, "type": "text/plain" } ],
+  "components": [
+    { "name": "left-pad", "version": "1.3.0", "license": "MIT" }
+  ]
+}
+```
+
+- 每个组件必须含非空字符串 `name` 与 `license`（`version` 可选）；`name`+`license`
+  重复条目非法。结构、字段或文件清单条目非法为 `InputError`。
+- 对应关系校验：重扫产物得到的文件清单必须与 `files` 逐项一致（把 SBOM 绑定到产物），
+  SBOM 规范字节摘要必须等于证明 `subject.sbomDigest`（把 SBOM 绑定到证明），
+  重算的产物摘要必须等于证明 `subject.artifactDigest`（把证明绑定到产物）。任一不成立为
+  `VerificationError`。
+
+#### 发布策略（`--policy`）
+
+UTF-8 JSON 对象，`policyVersion` 为 `"1.0"`，仅允许 `policyVersion` 与 `conditions` 两个
+顶层字段；`conditions` 必须是**非空数组**（空策略为 `PolicyError`），每项为对象且 `type`
+必须是下表类型之一，取值符合该类型定义，条件内不允许多余字段：
+
+| `type` | 取值形式 | 判定 |
+| --- | --- | --- |
+| `sourceReference` | `{ type, reference }` 单值，或 `{ type, anyOf: [字符串…] }`（二者互斥，均非空、不重复） | 证明 `source.reference` 精确等于 `reference` 或命中 `anyOf` |
+| `signerIdentity` | `{ type, issuer, subject }`，或 `{ type, anyOf: [{ issuer, subject }…] }`（二者互斥；数组非空，条目含非空 `issuer`/`subject` 且不重复） | 证明 `signer.issuer` 与 `signer.subject` 同时精确匹配单值或命中 `anyOf` 任一条目 |
+| `artifactDigest` | `{ type, sha256 }`，64 位十六进制 SHA-256（大小写不敏感） | 重算并核实的产物摘要等于 `sha256` |
+| `allowedPackages` | `{ type, packages: [非空字符串…] }`，非空且不重复 | SBOM 每个 `components[].name` 都在允许名单内 |
+| `allowedLicenses` | `{ type, licenses: [非空字符串…] }`，非空且不重复 | SBOM 每个 `components[].license` 都在允许名单内（按字符串精确匹配） |
+
+- 策略可以只包含上述范围内的任意条件子集，但**不能为空策略**；包含未知条件类型、条件取值
+  不符合定义、未知（顶层或条件内）字段，均为 `PolicyError`。
+- 策略仅在签名与三方对应关系全部核实通过后才评估；来源/身份/摘要/包名/许可证约束不满足
+  **不是系统错误**，而是正常生成 `denied` 报告（退出码 4）。
+
+#### 报告（stdout）
+
+报告为 UTF-8、两空格缩进、键名固定按字典序的 JSON（末尾换行），不含时间戳或随机值；
+同一组输入字节多次运行逐字节一致。顶层字段固定为 `reportVersion`、`status`、`artifact`、
+`attestation`、`sbom`、`conditions`：
+
+- `status`：`"allowed"`（全部条件通过）或 `"denied"`（至少一个条件未通过）。
+- `artifact.digest`：经重扫核实的产物 SHA-256 摘要。
+- `attestation.path`：证明文件绝对路径；`attestation.source.repository` / `reference`：
+  证明中已核实的构建来源；`attestation.signer.issuer` / `subject` / `keyFingerprint`：
+  签名主体、证书身份与实际验签公钥指纹。
+- `sbom.path` / `digest` / `fileCount` / `packageCount`：物料清单路径、规范字节摘要、
+  文件条目数与组件（包）数。
+- `conditions`：与策略 `conditions` 同序的逐项结果，每项含：
+  - `condition`：条件类型标识；
+  - `expected`：策略要求的取值（名单类条件按 UTF-16 码元排序后输出）；
+  - `observed`：实际观测值。`allowedPackages` 为
+    `{ packageCount, disallowedPackages }`；`allowedLicenses` 为
+    `{ licenses: {包名: 许可证}, disallowedLicenses }`；其余条件为对应标量或身份对象；
+  - `result`：`"pass"` 或 `"denied"`。
+
+退出码与错误流：
+
+| 退出码 | 情形 | 输出位置 |
+| --- | --- | --- |
+| 0 | 全部条件通过，`status: "allowed"` | stdout 报告 |
+| 4 | 证明有效但违反来源/身份/摘要/包名/许可证约束，`status: "denied"` | stdout 报告 |
+| 2 | `InputError`（路径不存在/不可读、JSON 语法错误、缺少必需字段）或 `PolicyError`（空策略、未知条件类型、取值不符） | stderr 错误 JSON |
+| 3 | `VerificationError`（内嵌公钥非法、签名无效、证明产物摘要与实际产物不一致、证明或 SBOM 无法与产物建立对应关系） | stderr 错误 JSON |
+
+stderr 的错误 JSON 与既有命令同形：
+
+```json
+{ "status": "ERROR", "errorCode": "InputError", "message": "<简短说明>" }
+```
+
+`gate` 的错误码与退出码独立于既有命令（既有命令仍为各自错误码与退出码 1），互不影响。
+
 ## 错误码
 
 任何失败都以**非零退出码**结束，并在 stderr 输出机器可读 JSON：
@@ -358,6 +501,11 @@ node provguard.mjs verify   --artifact dist/ \
   --policy policy.json \
   --policy-signature attestation/policy.json.sig \
   --policy-key keys/provguard.public.pem
+# 独立发布门禁（四类本地公开输入；allowed 退出 0，denied 退出 4）：
+node provguard.mjs gate     --artifact dist/ \
+  --attestation release.attestation.json \
+  --sbom release.sbom.json \
+  --policy release.policy.json
 ```
 
 ## 测试
@@ -388,3 +536,7 @@ generate 失败前不写证明、verify 扫描阶段报错，以及安全内部�
 verify 独立文件与分发包两种模式往返、错误签名密钥/篡改策略/错误公钥、签名
 Base64 与长度非法、各路径缺失与不可读、非 Ed25519 密钥、参数不成对或缺 `--policy`、
 策略违规仍返回 `POLICY_VIOLATION`，以及证明/产物篡改优先于策略签名校验。
+发布门禁测试覆盖 allowed/denied 报告与退出码（0/4）、五类条件的期望/观测值与排序、
+缺参与四类输入路径不存在、JSON 语法错误、证明/SBOM 缺字段、空策略、缺 conditions、
+未知条件类型与条件取值不符、策略顶层/条件内未知字段、签名无效与内嵌公钥非法、
+产物摘要不一致、SBOM 与产物无对应、证明与 SBOM 摘要不绑定、报告逐字节确定以及成功不落盘。

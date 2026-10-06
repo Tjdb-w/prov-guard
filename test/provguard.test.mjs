@@ -2,13 +2,13 @@
 // 运行：node --test
 import { spawnSync } from 'node:child_process';
 import { sign as cryptoSign, createPrivateKey, createPublicKey, createHash, generateKeyPairSync } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { stableJsonStringify } from '../provguard.mjs';
+import { stableJsonStringify, sha256Hex } from '../provguard.mjs';
 
 const CLI = fileURLToPath(new URL('../provguard.mjs', import.meta.url));
 
@@ -2055,4 +2055,406 @@ test('产物篡改优先于 1.1 文件级规则（不进入策略评估）', () 
   const v = verifyWithPolicy(k.pub, p);
   assert.equal(v.code, 1);
   assert.equal(v.stderr.errorCode, 'INTEGRITY_MISMATCH');
+});
+
+// ---------------------------------------------------------------------------
+// 发布门禁（gate）
+// ---------------------------------------------------------------------------
+
+const GATE_COMPONENTS = [
+  { name: 'left-pad', version: '1.3.0', license: 'MIT' },
+  { name: 'widget', version: '2.0.0', license: 'Apache-2.0' },
+];
+
+// 基于 generate 产物构造 gate 三件输入：含 components 的 SBOM、自包含签名证明、
+// 默认全匹配策略可另行用 writeGatePolicy 覆盖。
+function gateSetup({ components = GATE_COMPONENTS, payloadOverrides, signWith, publicKeyOverride, signatureOverride } = {}) {
+  const k = keygen(paths.keys);
+  generate(paths.art, k.priv, paths.out);
+  const proof = readProof();
+  const baseSbom = JSON.parse(readFileSync(join(paths.out, 'sbom.json'), 'utf8'));
+  const sbom = { ...baseSbom, components };
+  const sbomPath = join(root, 'gate.sbom.json');
+  writeFileSync(sbomPath, `${stableJsonStringify(sbom)}\n`);
+  const sbomDigest = sha256Hex(stableJsonStringify(sbom));
+
+  const payload = {
+    attestationVersion: '1.0',
+    subject: {
+      artifactName: proof.artifactName,
+      artifactDigest: proof.artifactDigest,
+      sbomDigest,
+    },
+    source: { repository: 'https://git.example.com/team/app', reference: 'refs/tags/v1.2.3' },
+    signer: { issuer: 'https://oidc.example.com', subject: 'ci@example.com' },
+    ...payloadOverrides,
+  };
+  const signingKey = signWith ? createPrivateKey(readFileSync(signWith)) : createPrivateKey(readFileSync(k.priv));
+  const signature =
+    signatureOverride ??
+    cryptoSign(null, Buffer.from(stableJsonStringify(payload), 'utf8'), signingKey).toString('base64');
+  const attestation = {
+    ...payload,
+    signature,
+    publicKey: publicKeyOverride ?? readFileSync(k.pub, 'utf8'),
+  };
+  const attPath = join(root, 'gate.attestation.json');
+  writeFileSync(attPath, `${stableJsonStringify(attestation)}\n`);
+  return { k, sbom, sbomPath, sbomDigest, attestation, attPath, proof };
+}
+
+function writeGatePolicy(conditions, name = 'gate.policy.json') {
+  const p = join(root, name);
+  writeFileSync(p, `${stableJsonStringify({ policyVersion: '1.0', conditions })}\n`);
+  return p;
+}
+
+function writeGatePolicyRaw(obj, name = 'gate.policy.json') {
+  const p = join(root, name);
+  writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj));
+  return p;
+}
+
+function runGate(art, attPath, sbomPath, polPath) {
+  return run(['gate', '--artifact', art, '--attestation', attPath, '--sbom', sbomPath, '--policy', polPath]);
+}
+
+const allMatchConditions = (g) => [
+  { type: 'sourceReference', reference: 'refs/tags/v1.2.3' },
+  { type: 'signerIdentity', issuer: 'https://oidc.example.com', subject: 'ci@example.com' },
+  { type: 'artifactDigest', sha256: g.proof.artifactDigest },
+  { type: 'allowedPackages', packages: ['left-pad', 'widget'] },
+  { type: 'allowedLicenses', licenses: ['Apache-2.0', 'MIT'] },
+];
+
+test('gate：五类条件全部通过 -> allowed（退出 0），报告含已核实摘要/来源/包数', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stderr, null);
+  assert.equal(v.stdout.reportVersion, '1.0');
+  assert.equal(v.stdout.status, 'allowed');
+  assert.equal(v.stdout.artifact.digest, g.proof.artifactDigest);
+  assert.equal(v.stdout.attestation.path, g.attPath);
+  assert.equal(v.stdout.attestation.source.repository, 'https://git.example.com/team/app');
+  assert.equal(v.stdout.attestation.source.reference, 'refs/tags/v1.2.3');
+  assert.equal(v.stdout.attestation.signer.issuer, 'https://oidc.example.com');
+  assert.equal(v.stdout.attestation.signer.subject, 'ci@example.com');
+  assert.match(v.stdout.attestation.signer.keyFingerprint, /^[0-9a-f]{64}$/);
+  assert.equal(v.stdout.sbom.path, g.sbomPath);
+  assert.equal(v.stdout.sbom.digest, g.sbomDigest);
+  assert.equal(v.stdout.sbom.fileCount, 4);
+  assert.equal(v.stdout.sbom.packageCount, 2);
+  assert.deepEqual(v.stdout.conditions.map((c) => c.condition), [
+    'sourceReference',
+    'signerIdentity',
+    'artifactDigest',
+    'allowedPackages',
+    'allowedLicenses',
+  ]);
+  assert.ok(v.stdout.conditions.every((c) => c.result === 'pass'));
+});
+
+test('gate：摘要条件大小写不敏感；conditions 顺序与策略一致', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy([
+    { type: 'allowedLicenses', licenses: ['MIT', 'Apache-2.0'] },
+    { type: 'artifactDigest', sha256: g.proof.artifactDigest.toUpperCase() },
+  ]);
+  const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.deepEqual(v.stdout.conditions.map((c) => c.condition), ['allowedLicenses', 'artifactDigest']);
+  // expected 统一规范化为小写。
+  assert.equal(v.stdout.conditions[1].expected, g.proof.artifactDigest);
+});
+
+test('gate：部分条件违反 -> denied 报告（退出 4），逐项给出 expected/observed/result', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy([
+    { type: 'sourceReference', anyOf: ['refs/heads/main', 'refs/tags/v9.9.9'] },
+    { type: 'signerIdentity', anyOf: [{ issuer: 'https://other.example.com', subject: 'bot@example.com' }] },
+    { type: 'artifactDigest', sha256: '0'.repeat(64) },
+    { type: 'allowedPackages', packages: ['left-pad'] },
+    { type: 'allowedLicenses', licenses: ['MIT'] },
+  ]);
+  const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v.code, 4, JSON.stringify(v.stderr));
+  assert.equal(v.stderr, null); // denied 是正常报告，不走 stderr
+  assert.equal(v.stdout.status, 'denied');
+  assert.equal(v.stdout.artifact.digest, g.proof.artifactDigest);
+  assert.equal(v.stdout.sbom.packageCount, 2);
+
+  const byType = Object.fromEntries(v.stdout.conditions.map((c) => [c.condition, c]));
+  assert.equal(byType.sourceReference.result, 'denied');
+  assert.deepEqual(byType.sourceReference.expected, ['refs/heads/main', 'refs/tags/v9.9.9']);
+  assert.equal(byType.sourceReference.observed, 'refs/tags/v1.2.3');
+
+  assert.equal(byType.signerIdentity.result, 'denied');
+  assert.deepEqual(byType.signerIdentity.observed, {
+    issuer: 'https://oidc.example.com',
+    subject: 'ci@example.com',
+  });
+
+  assert.equal(byType.artifactDigest.result, 'denied');
+  assert.equal(byType.artifactDigest.expected, '0'.repeat(64));
+  assert.equal(byType.artifactDigest.observed, g.proof.artifactDigest);
+
+  assert.equal(byType.allowedPackages.result, 'denied');
+  assert.deepEqual(byType.allowedPackages.expected, ['left-pad']);
+  assert.deepEqual(byType.allowedPackages.observed, {
+    packageCount: 2,
+    disallowedPackages: ['widget'],
+  });
+
+  assert.equal(byType.allowedLicenses.result, 'denied');
+  assert.deepEqual(byType.allowedLicenses.observed, {
+    licenses: { 'left-pad': 'MIT', widget: 'Apache-2.0' },
+    disallowedLicenses: ['Apache-2.0'],
+  });
+});
+
+test('gate：部分通过部分拒绝 -> denied，通过项 result 为 pass', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy([
+    { type: 'sourceReference', reference: 'refs/tags/v1.2.3' },
+    { type: 'allowedLicenses', licenses: ['MIT'] },
+  ]);
+  const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v.code, 4);
+  assert.equal(v.stdout.status, 'denied');
+  assert.deepEqual(v.stdout.conditions.map((c) => c.result), ['pass', 'denied']);
+});
+
+test('gate：多个越界包/许可证按 UTF-16 码元排序输出', () => {
+  const g = gateSetup({
+    components: [
+      { name: 'zlib', license: 'MIT' },
+      { name: 'alpha', license: 'GPL-3.0-only' },
+      { name: 'mid', license: 'UNKNOWN' },
+    ],
+  });
+  const p = writeGatePolicy([
+    { type: 'allowedPackages', packages: ['zlib'] },
+    { type: 'allowedLicenses', licenses: ['MIT'] },
+  ]);
+  const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v.code, 4);
+  const byType = Object.fromEntries(v.stdout.conditions.map((c) => [c.condition, c]));
+  assert.deepEqual(byType.allowedPackages.observed.disallowedPackages, ['alpha', 'mid']);
+  assert.deepEqual(byType.allowedLicenses.observed.disallowedLicenses, ['GPL-3.0-only', 'UNKNOWN']);
+});
+
+test('gate：报告逐字节确定，且成功时不额外写任何文件', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const args = [CLI, 'gate', '--artifact', paths.art, '--attestation', g.attPath, '--sbom', g.sbomPath, '--policy', p];
+  const snapshot = () => readdirSync(root, { recursive: true }).sort();
+  const before = snapshot();
+  const r1 = spawnSync(process.execPath, args, { encoding: 'utf8' });
+  const r2 = spawnSync(process.execPath, args, { encoding: 'utf8' });
+  assert.equal(r1.status, 0);
+  assert.equal(r1.stdout, r2.stdout); // 字节级一致
+  assert.deepEqual(snapshot(), before); // 输入目录无新增/改动条目
+});
+
+test('gate：可选 claims 随证明签名但不参与判定', () => {
+  const g = gateSetup({ payloadOverrides: { claims: { builtOn: 'example-runner' } } });
+  const p = writeGatePolicy([{ type: 'allowedLicenses', licenses: ['MIT', 'Apache-2.0'] }]);
+  const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stdout.status, 'allowed');
+});
+
+test('gate：缺少必填参数 -> InputError（退出 2），无 stdout 报告', () => {
+  const g = gateSetup();
+  const v = run(['gate', '--artifact', paths.art, '--attestation', g.attPath]);
+  assert.equal(v.code, 2);
+  assert.equal(v.stdout, null);
+  assert.equal(v.stderr.errorCode, 'InputError');
+});
+
+test('gate：四类输入路径不存在 -> InputError（退出 2）', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  assert.equal(runGate(join(root, 'nope'), g.attPath, g.sbomPath, p).stderr.errorCode, 'InputError');
+  assert.equal(runGate(paths.art, join(root, 'nope.json'), g.sbomPath, p).stderr.errorCode, 'InputError');
+  assert.equal(runGate(paths.art, g.attPath, join(root, 'nope.json'), p).stderr.errorCode, 'InputError');
+  assert.equal(runGate(paths.art, g.attPath, g.sbomPath, join(root, 'nope.json')).stderr.errorCode, 'InputError');
+});
+
+test('gate：任一输入 JSON 语法错误 -> InputError', () => {
+  const g = gateSetup();
+  const broken = writeGatePolicyRaw('{broken', 'broken.json');
+  assert.equal(runGate(paths.art, broken, g.sbomPath, writeGatePolicy(allMatchConditions(g))).stderr.errorCode, 'InputError');
+  assert.equal(runGate(paths.art, g.attPath, broken, writeGatePolicy(allMatchConditions(g))).stderr.errorCode, 'InputError');
+  assert.equal(runGate(paths.art, g.attPath, g.sbomPath, broken).stderr.errorCode, 'InputError');
+});
+
+test('gate：证明或 SBOM 缺少必需字段 -> InputError', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const del = (obj, keyPath) => {
+    const clone = JSON.parse(JSON.stringify(obj));
+    const keys = keyPath.split('.');
+    let cur = clone;
+    for (let i = 0; i < keys.length - 1; i += 1) cur = cur[keys[i]];
+    delete cur[keys[keys.length - 1]];
+    return clone;
+  };
+  const cases = [
+    [del(g.attestation, 'subject.sbomDigest'), 'att-missing-sbomDigest'],
+    [del(g.attestation, 'source.reference'), 'att-missing-reference'],
+    [del(g.attestation, 'signer.subject'), 'att-missing-signer-subject'],
+    [del(g.attestation, 'signature'), 'att-missing-signature'],
+    [{ ...g.attestation, attestationVersion: '2.0' }, 'att-bad-version'],
+    [del(g.sbom, 'components'), 'sbom-missing-components'],
+    [{ ...g.sbom, components: [{ name: 'x' }] }, 'sbom-component-no-license'],
+    [{ ...g.sbom, components: [{ license: 'MIT' }] }, 'sbom-component-no-name'],
+  ];
+  for (const [obj, name] of cases) {
+    const path = writeGatePolicyRaw(obj, `${name}.json`);
+    const useAtt = name.startsWith('att') ? path : g.attPath;
+    const useSbom = name.startsWith('sbom') ? path : g.sbomPath;
+    const v = runGate(paths.art, useAtt, useSbom, p);
+    assert.equal(v.code, 2, name);
+    assert.equal(v.stderr.errorCode, 'InputError', `${name}: ${JSON.stringify(v.stderr)}`);
+  }
+});
+
+test('gate：空策略 / conditions 缺失或非数组 -> PolicyError', () => {
+  const g = gateSetup();
+  const cases = [
+    [{ policyVersion: '1.0', conditions: [] }, 'empty'],
+    [{ policyVersion: '1.0' }, 'missing'],
+    [{ policyVersion: '1.0', conditions: {} }, 'not-array'],
+    [{ conditions: [] }, 'no-version'],
+    [{ policyVersion: '2.0', conditions: [{ type: 'allowedLicenses', licenses: ['MIT'] }] }, 'bad-version'],
+  ];
+  for (const [obj, name] of cases) {
+    const p = writeGatePolicyRaw(obj, `policy-${name}.json`);
+    const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+    assert.equal(v.code, 2, name);
+    assert.equal(v.stderr.errorCode, 'PolicyError', `${name}: ${JSON.stringify(v.stderr)}`);
+  }
+});
+
+test('gate：未知条件类型或条件取值不符 -> PolicyError', () => {
+  const g = gateSetup();
+  const cases = [
+    [{ type: 'not-a-real-condition' }, 'unknown-type'],
+    [{ type: 'sourceReference' }, 'source-no-value'],
+    [{ type: 'sourceReference', reference: 'refs/tags/v1', anyOf: ['refs/tags/v1'] }, 'source-both'],
+    [{ type: 'sourceReference', anyOf: [] }, 'source-anyof-empty'],
+    [{ type: 'sourceReference', anyOf: ['a', 'a'] }, 'source-anyof-dup'],
+    [{ type: 'signerIdentity', issuer: 'i' }, 'identity-missing-subject'],
+    [{ type: 'signerIdentity', anyOf: [] }, 'identity-anyof-empty'],
+    [{ type: 'signerIdentity', anyOf: [{ issuer: 'i' }] }, 'identity-anyof-partial'],
+    [{ type: 'artifactDigest', sha256: 'xyz' }, 'digest-bad'],
+    [{ type: 'artifactDigest' }, 'digest-missing'],
+    [{ type: 'allowedPackages', packages: [] }, 'packages-empty'],
+    [{ type: 'allowedPackages', packages: ['ok', 3] }, 'packages-nonstring'],
+    [{ type: 'allowedLicenses' }, 'licenses-missing'],
+    [{ type: 'allowedLicenses', licenses: ['MIT', 'MIT'] }, 'licenses-dup'],
+    [{ type: 'allowedLicenses', licenses: ['MIT'], bogus: 1 }, 'condition-extra-field'],
+  ];
+  for (const [cond, name] of cases) {
+    const p = writeGatePolicy([cond], `policy-cond-${name}.json`);
+    const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+    assert.equal(v.code, 2, name);
+    assert.equal(v.stderr.errorCode, 'PolicyError', `${name}: ${JSON.stringify(v.stderr)}`);
+    assert.equal(v.stdout, null, name);
+  }
+});
+
+test('gate：策略顶层未知字段 -> PolicyError', () => {
+  const g = gateSetup();
+  const p = writeGatePolicyRaw(
+    { policyVersion: '1.0', conditions: [{ type: 'allowedLicenses', licenses: ['MIT'] }], weird: 1 },
+    'policy-top-unknown.json',
+  );
+  const v = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v.code, 2);
+  assert.equal(v.stderr.errorCode, 'PolicyError');
+});
+
+test('gate：签名被篡改 / 内嵌错误公钥 / 非法公钥 -> VerificationError（退出 3）', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+
+  const tampered = { ...g.attestation, signature: g.attestation.signature.replace(/^./, 'A') };
+  const tamperedPath = writeGatePolicyRaw(tampered, 'att-tampered.json');
+  const v1 = runGate(paths.art, tamperedPath, g.sbomPath, p);
+  assert.equal(v1.code, 3);
+  assert.equal(v1.stderr.errorCode, 'VerificationError');
+
+  const k2 = keygen(paths.keys2);
+  const wrongKey = gateSetup({ publicKeyOverride: readFileSync(k2.pub, 'utf8') });
+  const v2 = runGate(paths.art, wrongKey.attPath, wrongKey.sbomPath, p);
+  assert.equal(v2.code, 3);
+  assert.equal(v2.stderr.errorCode, 'VerificationError');
+
+  const badKey = gateSetup({ publicKeyOverride: '-----BEGIN PUBLIC KEY-----\nnot-a-key\n-----END PUBLIC KEY-----\n' });
+  const v3 = runGate(paths.art, badKey.attPath, badKey.sbomPath, p);
+  assert.equal(v3.code, 3);
+  assert.equal(v3.stderr.errorCode, 'VerificationError');
+});
+
+test('gate：产物被改动或增删文件 -> VerificationError（证明摘要与实际不一致）', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  writeFileSync(join(paths.art, 'a.txt'), 'tampered content\n');
+  const v1 = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v1.code, 3);
+  assert.equal(v1.stderr.errorCode, 'VerificationError');
+  assert.equal(v1.stdout, null);
+
+  writeFileSync(join(paths.art, 'a.txt'), 'hello world\n');
+  writeFileSync(join(paths.art, 'brand-new.txt'), 'extra\n');
+  const v2 = runGate(paths.art, g.attPath, g.sbomPath, p);
+  assert.equal(v2.code, 3);
+  assert.equal(v2.stderr.errorCode, 'VerificationError');
+});
+
+test('gate：SBOM 文件清单与产物不一致 -> VerificationError（无法建立对应关系）', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const wrongSbom = {
+    ...g.sbom,
+    files: g.sbom.files.map((f) => (f.path === 'a.txt' ? { ...f, sha256: '0'.repeat(64) } : f)),
+  };
+  const wrongPath = writeGatePolicyRaw(wrongSbom, 'sbom-unrelated.json');
+  const v = runGate(paths.art, g.attPath, wrongPath, p);
+  assert.equal(v.code, 3);
+  assert.equal(v.stderr.errorCode, 'VerificationError');
+});
+
+test('gate：证明记录的 sbomDigest 与 SBOM 不符（重签后仍被识别）-> VerificationError', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  // 文件清单仍与产物一致，但证明绑定了另一个 sbomDigest；签名本身有效。
+  const rebound = gateSetup({ payloadOverrides: { subject: { ...g.attestation.subject, sbomDigest: '0'.repeat(64) } } });
+  const v = runGate(paths.art, rebound.attPath, g.sbomPath, p);
+  assert.equal(v.code, 3);
+  assert.equal(v.stderr.errorCode, 'VerificationError');
+});
+
+test('gate：签名无效优先于策略判定（不会产生 denied 报告）', () => {
+  const g = gateSetup();
+  // 策略本身合法但必然拒绝；证明签名同时被破坏，必须报 VerificationError。
+  const p = writeGatePolicy([{ type: 'allowedLicenses', licenses: ['NO-SUCH-LICENSE'] }]);
+  const tampered = { ...g.attestation, signature: g.attestation.signature.replace(/^./, 'B') };
+  const tamperedPath = writeGatePolicyRaw(tampered, 'att-tampered-deny.json');
+  const v = runGate(paths.art, tamperedPath, g.sbomPath, p);
+  assert.equal(v.code, 3);
+  assert.equal(v.stderr.errorCode, 'VerificationError');
+  assert.equal(v.stdout, null);
+});
+
+test('gate：JSON 顶层为数组或 null -> InputError', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const arrPath = writeGatePolicyRaw('[1,2,3]', 'array.json');
+  assert.equal(runGate(paths.art, arrPath, g.sbomPath, p).stderr.errorCode, 'InputError');
+  assert.equal(runGate(paths.art, g.attPath, arrPath, p).stderr.errorCode, 'InputError');
 });
