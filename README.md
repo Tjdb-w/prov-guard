@@ -450,6 +450,43 @@ stderr 的错误 JSON 与既有命令同形：
 
 `gate` 的错误码与退出码独立于既有命令（既有命令仍为各自错误码与退出码 1），互不影响。
 
+### 7. 生成门禁证明（`attest`）
+
+```
+node provguard.mjs attest \
+  --artifact <产物路径> \
+  --key <私钥.pem> \
+  --components '<JSON 数组>' \
+  --source-repository <仓库 URL> \
+  --source-reference <引用> \
+  --signer-issuer <签发者> \
+  --signer-subject <主体> \
+  --out <输出目录> \
+  [--claims '<JSON 对象>']
+```
+
+`attest` 是 `gate` 的证明生成入口：**独立扫描产物**（与 `generate` 相同的文件清单与
+符号链接安全规则），在 `--out` 目录生成 `gate.attestation.json` 与 `gate.sbom.json`，
+不依赖 `generate` 的输出，也不改变其他子命令的既有行为。`--out` 位于目录产物内部时
+自动从扫描中排除。
+
+- `gate.sbom.json`：文件级 SBOM（`schemaVersion: "1.0"`）附加 `components`。
+  `--components` 必须是 JSON 数组，每个组件的 `name`、`license` 为非空字符串，
+  `version` 可选且为字符串；不得存在 `name`+`license` 重复的组件。
+- `gate.attestation.json`：`attestationVersion: "1.0"` 自包含签名证明。
+  `subject.artifactDigest` 绑定产物清单，`subject.sbomDigest` 绑定 SBOM 稳定 JSON；
+  `source`/`signer` 取自命令行参数；`publicKey` 由私钥导出；`signature` 覆盖去掉
+  `signature`/`publicKey` 后载荷的规范字节。`--claims` 为可选 JSON 对象，存在即纳入
+  签名并写入证明，省略则不写该字段。
+
+两个输出均为稳定 JSON 加末尾换行，同一输入逐字节一致（无时间戳、无随机值）。
+全部校验、扫描与签名成功后才原子替换同名输出，失败不改写既有文件。
+成功在 stdout 输出 `ATTESTED` 结果（含输出文件绝对路径、`artifactDigest`、`sbomDigest`
+与 `signerKeyFingerprint`），退出 0。缺参、未知参数、空值、`components`/`claims`
+结构非法、`version` 非字符串或组件重复均为 `USAGE_ERROR`（退出 1）；输入路径、私钥与
+符号链接问题沿用既有错误码（`INPUT_NOT_FOUND` / `PERMISSION_DENIED` / `KEY_NOT_FOUND` /
+`SYMLINK_INVALID`）。生成的两个文件可直接交给 `gate`。
+
 ## 错误码
 
 任何失败都以**非零退出码**结束，并在 stderr 输出机器可读 JSON：
@@ -474,7 +511,7 @@ stderr 的错误 JSON 与既有命令同形：
 | `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`/`"1.1"`、指纹白名单为空数组、`proofNotBefore` 晚于 `proofNotAfter`、1.0 携带 `requiredFiles`/`forbiddenFiles`、1.1 文件级字段为空对象/空数组或类型非法、路径为空/绝对/含反斜杠/空路径段/点目录段、摘要不是 64 位小写十六进制、`forbiddenFiles` 重复或与 `requiredFiles` 重叠（验证与 `policy-sign` 相同） |
 | `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM、共签、策略签名）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小、文件级规则（必需缺失 → 必需摘要不符 → 禁止出现，同类按路径 UTF-16 码元升序）列出全部违规，每项含 `rule` 与 `observed` |
 | `SYMLINK_INVALID` | 目录扫描发现危险符号链接：形成回路（`details.reason` 为 `cycle`）或目标越出产物根目录（`details.reason` 为 `outside-root`）；`details.path` 为链接的相对路径。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败 |
-| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量，`--bundle` 与独立文件参数（`--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures`）混用，包模式下 `--cosigner-key` 与 `--min-cosigners` 未同时提供，`policy-sign` 缺少 `--policy`/`--key`/`--signature`，或 `--policy-signature` 与 `--policy-key` 缺值、只给一者、未与 `--policy` 同时提供 |
+| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量，`--bundle` 与独立文件参数（`--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures`）混用，包模式下 `--cosigner-key` 与 `--min-cosigners` 未同时提供，`policy-sign` 缺少 `--policy`/`--key`/`--signature`，或 `--policy-signature` 与 `--policy-key` 缺值、只给一者、未与 `--policy` 同时提供；`attest` 缺少必填参数、含未知参数、参数值为空、`--components`/`--claims` 结构非法、组件 `version` 非字符串或组件重复 |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
 

@@ -13,6 +13,13 @@
 //            [--policy-signature <policy.json.sig> --policy-key <public.pem>]
 //   gate     --artifact <path> --attestation <gate.attestation.json>
 //            --sbom <gate.sbom.json> --policy <gate.policy.json>
+//   attest   --artifact <path> --key <private.pem> --components <json>
+//            --source-repository <url> --source-reference <ref>
+//            --signer-issuer <issuer> --signer-subject <subject>
+//            --out <dir> [--claims <json>]
+//
+// attest 为 gate 的证明生成入口：独立扫描产物并生成 gate.attestation.json 与
+// gate.sbom.json，不依赖 generate 的输出，也不改变其他子命令的既有行为。
 //
 // gate 为独立发布门禁：只接受本地公开文件（不读取密钥或凭证；验签公钥内嵌于
 // 证明），不改动其他子命令的文件格式、标准输出、退出码与异常处理。
@@ -2371,6 +2378,188 @@ export async function gate({ artifact, attestation, sbom, policy }) {
 }
 
 // ---------------------------------------------------------------------------
+// attest：gate 的证明生成入口（独立扫描产物，不依赖 generate 的输出）
+// ---------------------------------------------------------------------------
+//
+// 生成门禁两件输入：gate.sbom.json（文件级 SBOM schemaVersion 1.0 加 components）
+// 与 gate.attestation.json（attestationVersion 1.0 自包含签名证明）。
+// 证明 subject 以 artifactDigest 绑定产物、以 sbomDigest 绑定 SBOM 稳定 JSON；
+// source/signer 取自命令行参数；publicKey 由私钥导出；signature 覆盖去掉
+// signature/publicKey 后载荷的规范字节（与 gate 验签约定一致）。--claims 为可选
+// JSON 对象，存在即纳入签名并写入证明，省略则不写该字段。
+// 输出为稳定 JSON 加末尾换行，同一输入逐字节一致（无时间戳、无随机值）。
+// 全部校验、扫描与签名成功后才原子替换同名输出；任何失败不改写既有文件。
+//
+// 错误归类：缺参/未知参数/空值/components 或 claims 结构非法/version 非字符串/
+// 组件重复 -> USAGE_ERROR；输入路径问题 -> INPUT_NOT_FOUND / PERMISSION_DENIED；
+// 私钥无法解析或非 Ed25519 -> KEY_NOT_FOUND；越界或成环链接 -> SYMLINK_INVALID。
+
+// --components 解析与校验：必须是 JSON 数组；每项为对象，name/license 为非空字符串，
+// version 可选且为字符串；按 name+license 去重（与 gate 的 SBOM 校验口径一致）。
+function parseAttestComponents(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new ProvError(ERROR_CODES.USAGE_ERROR, '--components 不是合法的 JSON');
+  }
+  if (!Array.isArray(value)) {
+    throw new ProvError(ERROR_CODES.USAGE_ERROR, '--components 必须是 JSON 数组');
+  }
+  const seen = new Set();
+  for (let i = 0; i < value.length; i += 1) {
+    const c = value[i];
+    if (c === null || typeof c !== 'object' || Array.isArray(c)) {
+      throw new ProvError(ERROR_CODES.USAGE_ERROR, `--components 第 ${i} 项必须是对象`);
+    }
+    if (typeof c.name !== 'string' || c.name.length === 0) {
+      throw new ProvError(ERROR_CODES.USAGE_ERROR, `--components 第 ${i} 项 name 缺失或不是非空字符串`);
+    }
+    if (typeof c.license !== 'string' || c.license.length === 0) {
+      throw new ProvError(ERROR_CODES.USAGE_ERROR, `--components 第 ${i} 项 license 缺失或不是非空字符串`);
+    }
+    if (c.version !== undefined && typeof c.version !== 'string') {
+      throw new ProvError(ERROR_CODES.USAGE_ERROR, `--components 第 ${i} 项 version 必须是字符串`);
+    }
+    const dedupKey = `${c.name}\u0000${c.license}`;
+    if (seen.has(dedupKey)) {
+      throw new ProvError(ERROR_CODES.USAGE_ERROR, `--components 存在重复组件（name+license 相同）: ${c.name}`);
+    }
+    seen.add(dedupKey);
+  }
+  return value;
+}
+
+// --claims 解析与校验：必须是 JSON 对象（存在即签名，省略则不写）。
+function parseAttestClaims(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new ProvError(ERROR_CODES.USAGE_ERROR, '--claims 不是合法的 JSON');
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ProvError(ERROR_CODES.USAGE_ERROR, '--claims 必须是 JSON 对象');
+  }
+  return value;
+}
+
+export async function attest({
+  artifact,
+  key,
+  components: componentsRaw,
+  sourceRepository,
+  sourceReference,
+  signerIssuer,
+  signerSubject,
+  out,
+  claims: claimsRaw,
+}) {
+  // 1) 参数校验（USAGE_ERROR）：先于任何文件系统访问完成。
+  const requiredStrings = [
+    ['artifact', artifact],
+    ['key', key],
+    ['components', componentsRaw],
+    ['source-repository', sourceRepository],
+    ['source-reference', sourceReference],
+    ['signer-issuer', signerIssuer],
+    ['signer-subject', signerSubject],
+    ['out', out],
+  ];
+  for (const [name, v] of requiredStrings) {
+    if (typeof v !== 'string' || v.length === 0) {
+      throw new ProvError(ERROR_CODES.USAGE_ERROR, `缺少必填参数或参数值为空: --${name}`);
+    }
+  }
+  if (claimsRaw !== undefined && (typeof claimsRaw !== 'string' || claimsRaw.length === 0)) {
+    throw new ProvError(ERROR_CODES.USAGE_ERROR, '--claims 需要提供非空的 JSON 对象');
+  }
+  const components = parseAttestComponents(componentsRaw);
+  const claims = claimsRaw === undefined ? undefined : parseAttestClaims(claimsRaw);
+
+  // 2) 输入检查：产物与私钥必须存在且可读。
+  const artifactAbs = resolve(artifact);
+  const keyAbs = resolve(key);
+  for (const [p, label] of [
+    [artifactAbs, '产物'],
+    [keyAbs, '私钥'],
+  ]) {
+    try {
+      await access(p, fsConstants.R_OK);
+    } catch (err) {
+      throw wrapFsError(err, `读取${label}`);
+    }
+  }
+
+  // 3) 输出目录：若位于产物内部则从扫描中排除（与 generate 相同的自排除规则）。
+  const outAbs = resolve(out);
+  try {
+    await mkdir(outAbs, { recursive: true });
+  } catch (err) {
+    throw wrapFsError(err, '创建输出目录');
+  }
+  let outReal;
+  try {
+    outReal = await realpath(outAbs);
+  } catch (err) {
+    throw wrapFsError(err, '解析输出目录');
+  }
+
+  // 4) 私钥必须可解析且为 Ed25519（KEY_NOT_FOUND）；公钥由私钥导出并写入证明。
+  const privateKey = readPrivateKey(keyAbs);
+  const signingPublicKey = createPublicKey(privateKey);
+  const signerKeyFingerprint = keyFingerprint(signingPublicKey);
+
+  // 5) 扫描产物并构建 SBOM（复用文件清单与安全扫描语义），附加 components。
+  const baseSbom = await buildSbom(artifactAbs, outReal);
+  const sbom = { ...baseSbom, components };
+  const artifactDigest = computeArtifactDigest(baseSbom);
+  const sbomCanonical = stableJsonStringify(sbom);
+  const sbomDigest = sha256Hex(sbomCanonical);
+
+  // 6) 构造证明载荷并签名：签名输入为去掉 signature/publicKey 的载荷规范字节。
+  const payload = {
+    attestationVersion: GATE_ATTESTATION_VERSION,
+    subject: {
+      artifactName: basename(artifactAbs),
+      artifactDigest,
+      sbomDigest,
+    },
+    source: { repository: sourceRepository, reference: sourceReference },
+    signer: { issuer: signerIssuer, subject: signerSubject },
+  };
+  if (claims !== undefined) payload.claims = claims;
+  const signature = cryptoSign(
+    null,
+    Buffer.from(stableJsonStringify(payload), 'utf8'),
+    privateKey,
+  ).toString('base64');
+  const attestation = {
+    ...payload,
+    signature,
+    publicKey: signingPublicKey.export({ type: 'spki', format: 'pem' }),
+  };
+
+  // 7) 全部校验、扫描与签名成功后才原子替换同名输出；失败不改写既有文件。
+  const attestationPath = join(outReal, 'gate.attestation.json');
+  const sbomPath = join(outReal, 'gate.sbom.json');
+  try {
+    await atomicWrite(attestationPath, `${stableJsonStringify(attestation)}\n`);
+    await atomicWrite(sbomPath, `${sbomCanonical}\n`);
+  } catch (err) {
+    throw wrapFsError(err, '写入门禁证明产物');
+  }
+
+  return {
+    attestationPath,
+    sbomPath,
+    artifactDigest,
+    sbomDigest,
+    signerKeyFingerprint,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -2423,6 +2612,10 @@ function usage() {
     '                      [--policy-signature <policy.json.sig> --policy-key <public.pem>]',
     '  provguard gate     --artifact <path> --attestation <gate.attestation.json> \\',
     '                      --sbom <gate.sbom.json> --policy <gate.policy.json>',
+    '  provguard attest   --artifact <path> --key <private.pem> \\',
+    '                      --components <json> --source-repository <url> \\',
+    '                      --source-reference <ref> --signer-issuer <issuer> \\',
+    '                      --signer-subject <subject> --out <dir> [--claims <json>]',
     '',
     'generate 输出: proof.json / proof.json.sig / sbom.json / sbom.json.sig',
     '启用共签时额外输出: proof.cosignatures.json / sbom.cosignatures.json',
@@ -2430,6 +2623,7 @@ function usage() {
     'policy-sign 输出: policy.json.sig（策略的 Ed25519 签名，不改动策略与密钥）',
     'gate: 独立发布门禁；成功在 stdout 输出 allowed（退出 0）或 denied（退出 4）报告，',
     '      InputError/PolicyError 退出 2，VerificationError 退出 3，均写 stderr。',
+    'attest 输出: gate.attestation.json / gate.sbom.json（gate 的证明与 SBOM 输入）',
     '其余命令成功状态: VERIFIED；错误码见 README。',
   ].join('\n');
 }
@@ -2666,6 +2860,44 @@ async function main(argv) {
       });
       process.stdout.write(r.reportText);
       return r.exitCode;
+    }
+
+    if (command === 'attest') {
+      // attest 只接受固定参数集合；未知参数（含多余位置参数）一律 USAGE_ERROR。
+      const known = new Set([
+        'artifact',
+        'key',
+        'components',
+        'source-repository',
+        'source-reference',
+        'signer-issuer',
+        'signer-subject',
+        'out',
+        'claims',
+      ]);
+      const unknown = Object.keys(args).filter((k) => k !== '_' && !known.has(k));
+      if (unknown.length) {
+        throw new ProvError(
+          ERROR_CODES.USAGE_ERROR,
+          `未知参数: ${unknown.map((k) => `--${k}`).join(', ')}`,
+        );
+      }
+      if (args._.length > 1) {
+        throw new ProvError(ERROR_CODES.USAGE_ERROR, `未知参数: ${args._.slice(1).join(' ')}`);
+      }
+      const r = await attest({
+        artifact: args.artifact,
+        key: args.key,
+        components: args.components,
+        sourceRepository: args['source-repository'],
+        sourceReference: args['source-reference'],
+        signerIssuer: args['signer-issuer'],
+        signerSubject: args['signer-subject'],
+        out: args.out,
+        claims: args.claims,
+      });
+      process.stdout.write(`${stableJsonStringify({ status: 'ATTESTED', ...r })}\n`);
+      return 0;
     }
 
     throw new ProvError(ERROR_CODES.USAGE_ERROR, `未知子命令: ${command}`);
