@@ -2458,3 +2458,168 @@ test('gate：JSON 顶层为数组或 null -> InputError', () => {
   assert.equal(runGate(paths.art, arrPath, g.sbomPath, p).stderr.errorCode, 'InputError');
   assert.equal(runGate(paths.art, g.attPath, arrPath, p).stderr.errorCode, 'InputError');
 });
+
+// --trusted-key 信任固定
+// ---------------------------------------------------------------------------
+
+function gateTrustedArgs(g, polPath, trustedPaths) {
+  const args = ['gate', '--artifact', paths.art, '--attestation', g.attPath, '--sbom', g.sbomPath, '--policy', polPath];
+  for (const t of trustedPaths) args.push('--trusted-key', t);
+  return args;
+}
+
+function spkiSha256(pubPath) {
+  return createHash('sha256')
+    .update(createPublicKey(readFileSync(pubPath)).export({ type: 'spki', format: 'der' }))
+    .digest('hex');
+}
+
+test('gate：--trusted-key 命中内嵌公钥 -> allowed，报告与无固定时逐字节一致', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const base = runGate(paths.art, g.attPath, g.sbomPath, p);
+  const v = run(gateTrustedArgs(g, p, [g.k.pub]));
+  assert.equal(v.code, 0, JSON.stringify(v.stderr));
+  assert.equal(v.stderr, null);
+  assert.equal(v.stdout.status, 'allowed');
+  // 命中后报告字段与缺省模式完全相同（信任固定不改变任何报告字段）。
+  assert.deepEqual(v.stdout, base.stdout);
+  // attestation.keyFingerprint 仍为内嵌公钥指纹，且与命中的受信公钥指纹一致。
+  assert.equal(v.stdout.attestation.signer.keyFingerprint, spkiSha256(g.k.pub));
+});
+
+test('gate：多个 --trusted-key 任一命中即通过；重复同一公钥不是错误', () => {
+  const g = gateSetup();
+  const k2 = keygen(paths.keys2);
+  const p = writeGatePolicy(allMatchConditions(g));
+  // 先给不匹配的，再给匹配的：命中任意一个即可。
+  const v1 = run(gateTrustedArgs(g, p, [k2.pub, g.k.pub]));
+  assert.equal(v1.code, 0, JSON.stringify(v1.stderr));
+  assert.equal(v1.stdout.status, 'allowed');
+  // 重复指向同一公钥不是错误。
+  const v2 = run(gateTrustedArgs(g, p, [g.k.pub, g.k.pub]));
+  assert.equal(v2.code, 0, JSON.stringify(v2.stderr));
+  assert.equal(v2.stdout.status, 'allowed');
+});
+
+test('gate：受信公钥均不匹配 -> VerificationError（退出 3），无 stdout 报告', () => {
+  const g = gateSetup();
+  const k2 = keygen(paths.keys2);
+  const p = writeGatePolicy(allMatchConditions(g));
+  const v = run(gateTrustedArgs(g, p, [k2.pub]));
+  assert.equal(v.code, 3);
+  assert.equal(v.stdout, null);
+  assert.equal(v.stderr.errorCode, 'VerificationError');
+  assert.match(v.stderr.message, /受信公钥指纹/);
+});
+
+test('gate：信任固定先于签名验证（固定不匹配时报指纹不命中，而非签名无效）', () => {
+  const g = gateSetup();
+  const k2 = keygen(paths.keys2);
+  const p = writeGatePolicy(allMatchConditions(g));
+  // 签名被篡改且固定为不匹配公钥：指纹固定阶段先失败。
+  const tampered = { ...g.attestation, signature: g.attestation.signature.replace(/^./, 'C') };
+  const tamperedPath = writeGatePolicyRaw(tampered, 'att-tampered-pin.json');
+  const vBadPin = run(gateTrustedArgs({ ...g, attPath: tamperedPath }, p, [k2.pub]));
+  assert.equal(vBadPin.code, 3);
+  assert.match(vBadPin.stderr.message, /未命中任何受信公钥指纹/);
+  // 同样的篡改但固定为匹配公钥：固定通过后仍按既有规则报签名无效。
+  const vGoodPin = run(gateTrustedArgs({ ...g, attPath: tamperedPath }, p, [g.k.pub]));
+  assert.equal(vGoodPin.code, 3);
+  assert.equal(vGoodPin.stderr.errorCode, 'VerificationError');
+  assert.match(vGoodPin.stderr.message, /签名无效/);
+});
+
+test('gate：受信公钥不匹配优先于策略 denied（退出 3 而非 4）', () => {
+  const g = gateSetup();
+  const k2 = keygen(paths.keys2);
+  // 策略本身合法但必然拒绝；公钥固定同时不匹配，必须报 VerificationError。
+  const p = writeGatePolicy([{ type: 'allowedLicenses', licenses: ['NO-SUCH-LICENSE'] }]);
+  const v = run(gateTrustedArgs(g, p, [k2.pub]));
+  assert.equal(v.code, 3);
+  assert.equal(v.stdout, null);
+  assert.equal(v.stderr.errorCode, 'VerificationError');
+  // 固定命中时策略拒绝仍为正常 denied（退出 4）。
+  const vAllowedKey = run(gateTrustedArgs(g, p, [g.k.pub]));
+  assert.equal(vAllowedKey.code, 4);
+  assert.equal(vAllowedKey.stdout.status, 'denied');
+  assert.equal(vAllowedKey.stderr, null);
+});
+
+test('gate：信任固定通过后，产物被改动仍为 VerificationError', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  writeFileSync(join(paths.art, 'a.txt'), 'tampered after pinning\n');
+  const v = run(gateTrustedArgs(g, p, [g.k.pub]));
+  assert.equal(v.code, 3);
+  assert.equal(v.stdout, null);
+  assert.equal(v.stderr.errorCode, 'VerificationError');
+});
+
+test('gate：--trusted-key 缺值或空值 -> InputError（退出 2）', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const base = ['gate', '--artifact', paths.art, '--attestation', g.attPath, '--sbom', g.sbomPath, '--policy', p];
+  const vMissing = run([...base, '--trusted-key']);
+  assert.equal(vMissing.code, 2);
+  assert.equal(vMissing.stdout, null);
+  assert.equal(vMissing.stderr.errorCode, 'InputError');
+  const vEmpty = run([...base, '--trusted-key', '']);
+  assert.equal(vEmpty.code, 2);
+  assert.equal(vEmpty.stdout, null);
+  assert.equal(vEmpty.stderr.errorCode, 'InputError');
+});
+
+test('gate：--trusted-key 路径缺失/是目录/非法 PEM/非 Ed25519/私钥 PEM -> InputError', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const expectInput = (keyPath) => {
+    const v = run(gateTrustedArgs(g, p, [keyPath]));
+    assert.equal(v.code, 2, keyPath);
+    assert.equal(v.stdout, null, keyPath);
+    assert.equal(v.stderr.errorCode, 'InputError', `${keyPath}: ${JSON.stringify(v.stderr)}`);
+  };
+  expectInput(join(root, 'nope.pem'));
+  // 目录路径无法作为公钥读取。
+  expectInput(paths.keys);
+  // 看似公钥 PEM 但内容无法解析。
+  expectInput(writeGatePolicyRaw(
+    '-----BEGIN PUBLIC KEY-----\nnot-a-key\n-----END PUBLIC KEY-----\n',
+    'garbage.pem',
+  ));
+  // 完全不是 PEM。
+  expectInput(writeGatePolicyRaw('this is not a pem\n', 'notpem.pem'));
+  // 合法 SPKI PEM 但不是 Ed25519（EC P-256）。
+  const ecPem = generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey.export({ type: 'spki', format: 'pem' });
+  expectInput(writeGatePolicyRaw(ecPem, 'ec.pub.pem'));
+  // --trusted-key 只接受公钥 PEM；私钥 PEM（即便可导出公钥）也按非法公钥处理。
+  expectInput(g.k.priv);
+});
+
+test('gate：多个 --trusted-key 中任一文件本身不可解析 -> InputError', () => {
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const badPath = writeGatePolicyRaw('not a pem\n', 'one-bad.pem');
+  // 即便其中一个是正确公钥，坏公钥也必须报 InputError。
+  const v = run(gateTrustedArgs(g, p, [g.k.pub, badPath]));
+  assert.equal(v.code, 2);
+  assert.equal(v.stdout, null);
+  assert.equal(v.stderr.errorCode, 'InputError');
+});
+
+test('gate：--trusted-key 文件不可读 -> InputError（root 下跳过）', () => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+  const g = gateSetup();
+  const p = writeGatePolicy(allMatchConditions(g));
+  const locked = join(root, 'locked.pub.pem');
+  writeFileSync(locked, readFileSync(g.k.pub));
+  chmodSync(locked, 0o000);
+  try {
+    const v = run(gateTrustedArgs(g, p, [locked]));
+    assert.equal(v.code, 2);
+    assert.equal(v.stdout, null);
+    assert.equal(v.stderr.errorCode, 'InputError');
+  } finally {
+    chmodSync(locked, 0o644);
+  }
+});

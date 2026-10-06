@@ -28,9 +28,11 @@
 - 目录扫描的符号链接安全处理：指向产物根目录内部文件/目录的链接按链接路径记录目标内容；
   形成回路或越出产物根目录的链接以 `SYMLINK_INVALID` 失败，不会继续递归或读取外部内容；
 - 独立发布门禁（`gate`）：仅读取本地产物、自包含签名证明、含包名与许可证的软件物料清单及
-  发布策略四类公开文件（不读取密钥或凭证，验签公钥内嵌于证明），验证签名与三方摘要对应关系后
+  发布策略四类公开文件（不读取密钥或凭证，默认验签公钥内嵌于证明），验证签名与三方摘要对应关系后
   逐项比对策略，在 stdout 输出确定性 JSON 报告（`allowed` 退出 0 / `denied` 退出 4），
-  `InputError`/`PolicyError` 退出 2、`VerificationError` 退出 3；
+  `InputError`/`PolicyError` 退出 2、`VerificationError` 退出 3；可选、可重复的
+  `--trusted-key` 把允许接受的证明签名公钥固定为指定 Ed25519 公钥指纹之一（缺省不提供时
+  行为完全不变）；
 - 机器可读的错误码与非零退出码。
 
 ## 约定
@@ -318,14 +320,15 @@ node provguard.mjs gate \
   --artifact <产物路径> \
   --attestation <gate.attestation.json> \
   --sbom <gate.sbom.json> \
-  --policy <gate.policy.json>
+  --policy <gate.policy.json> \
+  [--trusted-key <公钥.pem> ...]
 ```
 
 `gate` 是与既有 `generate`/`verify` 相互独立的发布门禁：**不改动**任何已有命令的默认行为、
-文件格式、标准输出、退出码与异常处理；门禁本身也**不读取任何私钥或凭证**（验签公钥内嵌于
-证明），只读取四个本地公开文件，成功时只向 stdout 写报告，不额外落盘。
+文件格式、标准输出、退出码与异常处理；门禁本身也**不读取任何私钥或凭证**（默认验签公钥内嵌于
+证明），只读取四个本地公开文件及可选的受信公钥文件，成功时只向 stdout 写报告，不额外落盘。
 
-四个参数均为必填，缺任一以 `InputError` 结束（退出码 2）：
+前四个参数均为必填，缺任一以 `InputError` 结束（退出码 2）：
 
 | 参数 | 含义 |
 | --- | --- |
@@ -333,9 +336,34 @@ node provguard.mjs gate \
 | `--attestation` | 自包含签名证明（gate attestation），内嵌公开验签公钥 |
 | `--sbom` | 发布物料清单：文件级 SBOM 外加 `components`（包名与许可证） |
 | `--policy` | 发布策略：非空 `conditions` 数组，仅允许受支持的条件类型 |
+| `--trusted-key` | **可选、可重复**：本地 Ed25519 公钥 PEM 文件，固定允许接受的证明签名公钥 |
 
-处理顺序：读取并解析四类输入 → 用证明内嵌公钥验证证明签名 → 重扫产物并核对证明记录的产物摘要
-→ 校验 SBOM 摘要并把 SBOM 清单与当前产物逐项对账 → 逐项评估策略条件 → 输出确定性 JSON 报告。
+处理顺序：读取并解析四类输入（及可选受信公钥）→ 提供 `--trusted-key` 时先解析证明与其内嵌
+公钥并要求内嵌公钥指纹命中至少一个受信公钥指纹 → 用证明内嵌公钥验证证明签名 → 重扫产物并
+核对证明记录的产物摘要 → 校验 SBOM 摘要并把 SBOM 清单与当前产物逐项对账 → 逐项评估策略条件
+→ 输出确定性 JSON 报告。
+
+#### 信任固定（可选 `--trusted-key`）
+
+缺省完全不提供 `--trusted-key` 时，门禁行为与之前完全一致：仍以证明内嵌公钥为唯一验签公钥，
+输入、处理顺序、报告字段、退出码与不落盘行为均不变。
+
+提供一个或多个 `--trusted-key <公钥.pem>` 时，门禁把允许接受的证明签名公钥固定为这些公钥
+之一：先解析证明与内嵌公钥，再要求内嵌公钥的 SHA-256 指纹（SPKI DER）至少命中一个受信公钥
+指纹；**命中后才继续**执行既有的证明签名验证、产物摘要与清单对应、SBOM 绑定及策略条件评估。
+
+- 每个值都必须是存在、可读的本地公钥 PEM，且可解析为 **Ed25519 公钥**；只接受公钥 PEM，
+  传入私钥 PEM 同样视为非法。
+- `--trusted-key` 出现但值为空，或任一路径不存在、不可读、不是合法 PEM、不是 Ed25519
+  公钥，均为 `InputError`（退出码 2，stderr 错误 JSON，stdout 不输出报告）。
+- 所有受信公钥都可解析，但没有任何指纹与证明内嵌公钥匹配时，为 `VerificationError`
+  （退出码 3）。该检查先于签名验证、产物/SBOM 对账与策略评估：因此签名被篡改、产物变化、
+  SBOM 不对应仍分别保留既有 `VerificationError` 语义，策略违规仍为 `denied`（退出码 4），
+  这些优先级关系不因信任固定改变。
+- 重复传入指向同一公钥的路径不是错误；多个受信公钥中任意一个指纹匹配即可通过。
+- 报告中的 `attestation.signer.keyFingerprint` 仍表示证明**内嵌公钥**的 SHA-256 指纹；
+  信任固定命中时它与命中的受信公钥指纹一致，报告不因提供该参数而新增或改变任何字段。
+- 整个门禁只读取四类既有公开输入及新增公钥文件，不读取私钥或凭证，也不创建或改写任何文件。
 
 #### 证明文件（`--attestation`）
 
@@ -439,8 +467,8 @@ UTF-8 JSON 对象，`policyVersion` 为 `"1.0"`，仅允许 `policyVersion` 与 
 | --- | --- | --- |
 | 0 | 全部条件通过，`status: "allowed"` | stdout 报告 |
 | 4 | 证明有效但违反来源/身份/摘要/包名/许可证约束，`status: "denied"` | stdout 报告 |
-| 2 | `InputError`（路径不存在/不可读、JSON 语法错误、缺少必需字段）或 `PolicyError`（空策略、未知条件类型、取值不符） | stderr 错误 JSON |
-| 3 | `VerificationError`（内嵌公钥非法、签名无效、证明产物摘要与实际产物不一致、证明或 SBOM 无法与产物建立对应关系） | stderr 错误 JSON |
+| 2 | `InputError`（路径不存在/不可读、JSON 语法错误、缺少必需字段，或 `--trusted-key` 空值/路径缺失/不可读/非法 PEM/非 Ed25519 公钥）或 `PolicyError`（空策略、未知条件类型、取值不符） | stderr 错误 JSON |
+| 3 | `VerificationError`（内嵌公钥非法、签名无效、证明产物摘要与实际产物不一致、证明或 SBOM 无法与产物建立对应关系，或提供了 `--trusted-key` 但没有任何受信公钥指纹与内嵌公钥匹配） | stderr 错误 JSON |
 
 stderr 的错误 JSON 与既有命令同形：
 
@@ -543,6 +571,12 @@ node provguard.mjs gate     --artifact dist/ \
   --attestation release.attestation.json \
   --sbom release.sbom.json \
   --policy release.policy.json
+# 可选信任固定：只接受内嵌公钥指纹命中下列任一公钥的证明（--trusted-key 可重复）：
+node provguard.mjs gate     --artifact dist/ \
+  --attestation release.attestation.json \
+  --sbom release.sbom.json \
+  --policy release.policy.json \
+  --trusted-key keys/provguard.public.pem
 ```
 
 ## 测试
@@ -576,4 +610,8 @@ Base64 与长度非法、各路径缺失与不可读、非 Ed25519 密钥、参�
 发布门禁测试覆盖 allowed/denied 报告与退出码（0/4）、五类条件的期望/观测值与排序、
 缺参与四类输入路径不存在、JSON 语法错误、证明/SBOM 缺字段、空策略、缺 conditions、
 未知条件类型与条件取值不符、策略顶层/条件内未知字段、签名无效与内嵌公钥非法、
-产物摘要不一致、SBOM 与产物无对应、证明与 SBOM 摘要不绑定、报告逐字节确定以及成功不落盘。
+产物摘要不一致、SBOM 与产物无对应、证明与 SBOM 摘要不绑定、报告逐字节确定以及成功不落盘；
+`--trusted-key` 信任固定测试覆盖命中（报告与缺省逐字节一致、指纹一致）、多个任一命中与
+重复同钥、全不命中（退出 3）、固定先于签名验证、不匹配优先于策略 denied、固定通过后产物
+仍校验、缺值/空值、路径缺失/目录/非法 PEM/非 Ed25519/私钥 PEM、多值中任一损坏以及
+不可读（root 下跳过）。

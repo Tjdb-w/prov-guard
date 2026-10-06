@@ -13,6 +13,7 @@
 //            [--policy-signature <policy.json.sig> --policy-key <public.pem>]
 //   gate     --artifact <path> --attestation <gate.attestation.json>
 //            --sbom <gate.sbom.json> --policy <gate.policy.json>
+//            [--trusted-key <public-key.pem> ...]
 //   attest   --artifact <path> --key <private.pem> --components <json>
 //            --source-repository <url> --source-reference <ref>
 //            --signer-issuer <issuer> --signer-subject <subject>
@@ -21,8 +22,11 @@
 // attest 为 gate 的证明生成入口：独立扫描产物并生成 gate.attestation.json 与
 // gate.sbom.json，不依赖 generate 的输出，也不改变其他子命令的既有行为。
 //
-// gate 为独立发布门禁：只接受本地公开文件（不读取密钥或凭证；验签公钥内嵌于
+// gate 为独立发布门禁：只接受本地公开文件（不读取密钥或凭证；默认验签公钥内嵌于
 // 证明），不改动其他子命令的文件格式、标准输出、退出码与异常处理。
+// gate 可重复提供 --trusted-key <public-key.pem> 以固定允许接受的证明签名公钥：
+// 给出后要求证明内嵌公钥指纹至少命中一个受信公钥指纹，命中才继续验签等既有流程；
+// 缺省不提供时行为与之前完全一致（仍以内嵌公钥为准）。
 // gate 全部错误在 stderr 输出错误码：InputError（退出 2）/ PolicyError（退出 2）/
 // VerificationError（退出 3）；策略拒绝为正常 denied 报告（退出 4），全部通过为
 // allowed 报告（退出 0）。
@@ -1784,22 +1788,27 @@ function evaluatePolicy(policy, proof, sbomMode) {
 // gate：独立发布门禁（不依赖、不改变既有 keygen/generate/policy-sign/verify）
 // ---------------------------------------------------------------------------
 //
-// 输入（均为本地公开文件，不读取任何私钥或凭证；验签公钥内嵌于证明）：
+// 输入（均为本地公开文件，不读取任何私钥或凭证；默认验签公钥内嵌于证明）：
 //   --artifact     产物路径（单个文件或目录，按与 generate/verify 相同的规则扫描）
 //   --attestation 自包含签名证明（gate attestation），结构见 GATE_ATTESTATION_VERSION
 //   --sbom         发布物料清单：文件级 SBOM（schemaVersion 1.0）加 components
 //                  （每个组件含 name 与 license）
 //   --policy       发布策略：非空 conditions 数组
+//   --trusted-key  可选、可重复的本地 Ed25519 公钥 PEM；给出后把允许接受的证明签名
+//                  公钥固定为这些指纹之一
 //
-// 处理顺序：读取并解析四类输入 -> 用证明内嵌公钥验证证明签名 -> 重扫产物并核对
-// 证明中的产物摘要 -> 校验 SBOM 摘要并与证明、当前产物三方对账 -> 逐项评估策略
-// 条件 -> 在 stdout 写出确定性 JSON 报告。成功（allowed/denied）不额外写任何文件。
+// 处理顺序：读取并解析四类输入（及可选受信公钥）-> 用证明内嵌公钥做信任固定检查
+// （提供 --trusted-key 时）-> 用内嵌公钥验证证明签名 -> 重扫产物并核对证明中的产物
+// 摘要 -> 校验 SBOM 摘要并与证明、当前产物三方对账 -> 逐项评估策略条件 -> 在 stdout
+// 写出确定性 JSON 报告。成功（allowed/denied）不额外写任何文件。
 //
 // 错误可观察结果（唯一）：
-//   InputError        退出 2：路径不存在/不可读、JSON 语法错误、缺少必需字段
+//   InputError        退出 2：路径不存在/不可读、JSON 语法错误、缺少必需字段、
+//                     --trusted-key 空值/路径缺失/不可读/不是合法 PEM 或非 Ed25519 公钥
 //   PolicyError       退出 2：策略为空、含未知条件类型或条件取值不符合定义
 //   VerificationError 退出 3：证明内嵌公钥非法、签名无效、证明中的产物摘要与实际
-//                     产物不一致、证明或 SBOM 无法与产物建立对应关系
+//                     产物不一致、证明或 SBOM 无法与产物建立对应关系，或提供了
+//                     --trusted-key 但没有任何受信公钥指纹与证明内嵌公钥匹配
 //   denied 报告       退出 4：证明有效但违反来源/身份/摘要/包名/许可证约束
 //   allowed 报告      退出 0：全部条件通过
 
@@ -1841,6 +1850,47 @@ function gatePolicyError(message) {
 
 function gateVerificationError(message) {
   return new GateError(GATE_ERROR_CODES.VERIFICATION, message);
+}
+
+// 加载可选的信任固定公钥：每个 --trusted-key 值必须是存在且可读的本地公钥 PEM，
+// 且可解析为 Ed25519 公钥。任何一个不满足都按门禁输入问题处理（InputError，退出 2）。
+// 仅接受显式的公钥 PEM（含 “PUBLIC KEY” 标记），不接受私钥 PEM——即便其可导出公钥，
+// 因为该参数契约为公钥文件；重复指向同一公钥不是错误，指纹在比对时按集合去重。
+// 返回 [{ key, fingerprint }]，顺序与命令行一致。
+async function loadGateTrustedKeys(trustedKeyPaths) {
+  const trusted = [];
+  for (const rawPath of trustedKeyPaths) {
+    const keyAbs = resolve(rawPath);
+    let pemBuf;
+    try {
+      pemBuf = await readFile(keyAbs);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        throw gateInputError(`受信公钥路径不存在 (${keyAbs})`);
+      }
+      if (err && (err.code === 'EACCES' || err.code === 'EPERM')) {
+        throw gateInputError(`受信公钥不可读（权限不足）: ${keyAbs}`);
+      }
+      throw gateInputError(`受信公钥无法读取: ${keyAbs}`);
+    }
+    const pemText = pemBuf.toString('utf8');
+    if (!/-----BEGIN[^-]*PUBLIC KEY-----/.test(pemText)) {
+      throw gateInputError(`受信公钥不是合法的公钥 PEM: ${keyAbs}`);
+    }
+    let keyObj;
+    try {
+      keyObj = createPublicKey({ key: pemText, format: 'pem' });
+    } catch {
+      throw gateInputError(`受信公钥无法解析或格式不受支持: ${keyAbs}`);
+    }
+    if (keyObj.asymmetricKeyType !== 'ed25519') {
+      throw gateInputError(
+        `受信公钥类型不是 Ed25519（实际为 ${keyObj.asymmetricKeyType}）: ${keyAbs}`,
+      );
+    }
+    trusted.push({ key: keyObj, fingerprint: keyFingerprint(keyObj) });
+  }
+  return trusted;
 }
 
 // 门禁输入读取：路径必须存在且可读（含符号链接安全的产物扫描），JSON 必须可解析。
@@ -2116,10 +2166,9 @@ function allowedKeys(cond, allowed, fail) {
   }
 }
 
-// 证明签名验证：内嵌 SPKI PEM 公钥必须可解析且为 Ed25519；signature 必须是
-// 合法 Base64 且长度为 64 字节；对证明载荷的规范字节验签。任一失败均为
-// VerificationError（公钥是证明的组成部分，非法公钥等同证明不可信）。
-function verifyGateAttestationSignature(attestation) {
+// 解析证明内嵌公钥：SPKI PEM 必须可解析且为 Ed25519；否则为 VerificationError
+//（公钥是证明的组成部分，非法公钥等同证明不可信）。
+function parseGateAttestationPublicKey(attestation) {
   let publicKey;
   try {
     publicKey = createPublicKey({ key: attestation.publicKey, format: 'pem' });
@@ -2131,6 +2180,27 @@ function verifyGateAttestationSignature(attestation) {
       `证明内嵌公钥类型不是 Ed25519（实际为 ${publicKey.asymmetricKeyType}）`,
     );
   }
+  return publicKey;
+}
+
+// 信任固定：提供 --trusted-key 时，证明内嵌公钥指纹必须命中至少一个受信公钥指纹，
+// 否则为 VerificationError（受信公钥本身不可解析已在加载阶段按 InputError 处理）。
+// 重复指向同一公钥不是错误，任一指纹匹配即可通过。
+function assertGateKeyTrusted(embeddedFingerprint, trustedKeys) {
+  if (trustedKeys.length === 0) return;
+  const embedded = embeddedFingerprint.toLowerCase();
+  const matches = trustedKeys.some((t) => t.fingerprint.toLowerCase() === embedded);
+  if (!matches) {
+    throw gateVerificationError(
+      '证明内嵌公钥未命中任何受信公钥指纹（不信任该签名密钥）',
+    );
+  }
+}
+
+// 证明签名验证：内嵌 SPKI PEM 公钥必须可解析且为 Ed25519；signature 必须是
+// 合法 Base64 且长度为 64 字节；对证明载荷的规范字节验签。任一失败均为
+// VerificationError（公钥是证明的组成部分，非法公钥等同证明不可信）。
+function verifyGateAttestationSignature(attestation, publicKey) {
   const sigB64 = attestation.signature.replace(/\s+/g, '');
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(sigB64) || sigB64.length === 0) {
     throw gateVerificationError('证明签名不是合法的 Base64 内容');
@@ -2324,9 +2394,15 @@ function buildGateReport({ decision, conditions, observed, attestationAbs, sbomA
 }
 
 // 门禁主入口：返回 { exitCode, reportText }；所有失败以 GateError 抛出。
-export async function gate({ artifact, attestation, sbom, policy }) {
+// trustedKeys 为可选的本地 Ed25519 公钥 PEM 路径数组：缺省/为空时行为与之前完全
+// 一致（以内嵌公钥为验签公钥）；给出时先做信任固定，再执行既有验签与对账流程。
+export async function gate({ artifact, attestation, sbom, policy, trustedKeys = [] }) {
   // 1) 读取并解析四类输入（InputError）。
   const inputs = await gateReadInputs({ artifact, attestation, sbom, policy });
+
+  // 1b) 加载可选受信公钥：路径、可读性、PEM 与 Ed25519 类型问题均为 InputError。
+  //     在任何验证之前完成，使“受信公钥本身不可用”稳定报 InputError（退出 2）。
+  const trusted = await loadGateTrustedKeys(trustedKeys);
 
   // 2) 结构校验：证明/SBOM 缺字段为 InputError；策略问题为 PolicyError。
   //    先做输入结构检查，再做策略检查，使“策略为空/未知类型”稳定报 PolicyError。
@@ -2334,17 +2410,23 @@ export async function gate({ artifact, attestation, sbom, policy }) {
   validateGateSbom(inputs.sbom);
   validateGatePolicy(inputs.policy);
 
-  // 3) 验证证明签名（VerificationError）。
-  const signer = verifyGateAttestationSignature(inputs.attestation);
+  // 3) 解析证明内嵌公钥（非法为 VerificationError），随后做信任固定：
+  //    提供 --trusted-key 时，内嵌公钥指纹必须命中至少一个受信公钥指纹，
+  //    未命中为 VerificationError；命中后才进入既有签名验证等流程。
+  const embeddedPublicKey = parseGateAttestationPublicKey(inputs.attestation);
+  assertGateKeyTrusted(keyFingerprint(embeddedPublicKey), trusted);
 
-  // 4) 证明摘要 -> 实际产物、SBOM -> 产物、SBOM 摘要 -> 证明（VerificationError）。
+  // 4) 验证证明签名（VerificationError）。
+  const signer = verifyGateAttestationSignature(inputs.attestation, embeddedPublicKey);
+
+  // 5) 证明摘要 -> 实际产物、SBOM -> 产物、SBOM 摘要 -> 证明（VerificationError）。
   const verified = await verifyGateCorrespondence({
     artifactAbs: inputs.artifactAbs,
     attestation: inputs.attestation,
     sbom: inputs.sbom,
   });
 
-  // 5) 逐项比对策略（约束违反不是系统错误，只决定 allowed/denied）。
+  // 6) 逐项比对策略（约束违反不是系统错误，只决定 allowed/denied）。
   const observed = {
     ...verified,
     sourceRepository: inputs.attestation.source.repository,
@@ -2566,7 +2648,7 @@ export async function attest({
 function parseArgs(argv) {
   const args = { _: [] };
   // 可重复参数：每次出现都追加到数组；其余参数保持“后出现覆盖先出现”。
-  const repeatable = new Set(['co-key', 'cosigner-key']);
+  const repeatable = new Set(['co-key', 'cosigner-key', 'trusted-key']);
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a.startsWith('--')) {
@@ -2611,7 +2693,8 @@ function usage() {
     '                      [--policy <policy.json>] \\',
     '                      [--policy-signature <policy.json.sig> --policy-key <public.pem>]',
     '  provguard gate     --artifact <path> --attestation <gate.attestation.json> \\',
-    '                      --sbom <gate.sbom.json> --policy <gate.policy.json>',
+    '                      --sbom <gate.sbom.json> --policy <gate.policy.json> \\',
+    '                      [--trusted-key <public-key.pem> ...]',
     '  provguard attest   --artifact <path> --key <private.pem> \\',
     '                      --components <json> --source-repository <url> \\',
     '                      --source-reference <ref> --signer-issuer <issuer> \\',
@@ -2852,11 +2935,23 @@ async function main(argv) {
           `缺少必填参数或参数值非法: ${missing.map((m) => `--${m}`).join(', ')}`,
         );
       }
+      // --trusted-key 可选、可重复；每次出现都必须带非空公钥路径。空值或缺值
+      // （参数后无取值）均为 InputError（退出 2）。
+      const trustedKeyRaw = args['trusted-key'];
+      if (trustedKeyRaw !== undefined) {
+        const list = Array.isArray(trustedKeyRaw) ? trustedKeyRaw : [trustedKeyRaw];
+        if (list.some((p) => typeof p !== 'string' || p.length === 0)) {
+          throw gateInputError('--trusted-key 需要提供本地 Ed25519 公钥 PEM 文件路径');
+        }
+      }
+      const trustedKeys =
+        trustedKeyRaw === undefined ? [] : Array.isArray(trustedKeyRaw) ? trustedKeyRaw : [trustedKeyRaw];
       const r = await gate({
         artifact: args.artifact,
         attestation: args.attestation,
         sbom: args.sbom,
         policy: args.policy,
+        trustedKeys,
       });
       process.stdout.write(r.reportText);
       return r.exitCode;
