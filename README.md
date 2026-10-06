@@ -450,6 +450,65 @@ stderr 的错误 JSON 与既有命令同形：
 
 `gate` 的错误码与退出码独立于既有命令（既有命令仍为各自错误码与退出码 1），互不影响。
 
+### 7. 生成 gate 证明（`attest`）
+
+```
+node provguard.mjs attest \
+  --artifact <产物路径> \
+  --key <private.pem> \
+  --components <JSON 数组> \
+  --source-repository <仓库 URL> \
+  --source-reference <引用> \
+  --signer-issuer <签发者> \
+  --signer-subject <主体> \
+  --out <输出目录> \
+  [--claims <JSON 对象>]
+```
+
+`attest` 是 `gate` 的证明生成入口：**独立扫描产物**并签名生成 `gate.attestation.json` 与
+`gate.sbom.json`，不依赖 `generate` 的输出，也不改变任何既有子命令的行为。错误沿用既有
+错误码与退出码（`USAGE_ERROR` 等，退出 1），成功在 stdout 输出 `ATTESTED` 结果（退出 0）。
+
+| 参数 | 含义 |
+| --- | --- |
+| `--artifact` | 待证明产物：单个文件或目录，按与 `generate`/`verify` 相同的规则递归扫描（含符号链接安全检查） |
+| `--key` | Ed25519 私钥（PEM）；公钥由私钥导出并内嵌于证明 |
+| `--components` | JSON 数组：每项含非空 `name` 与 `license`，`version` 可选且必须为字符串；`name`+`license` 不得重复 |
+| `--source-repository` / `--source-reference` | 写入证明 `source` 的构建来源 |
+| `--signer-issuer` / `--signer-subject` | 写入证明 `signer` 的签名主体身份 |
+| `--out` | 输出目录；目录产物扫描时自排除该目录（与 `generate` 一致） |
+| `--claims` | 可选 JSON 对象：存在即随证明一起签名并写入 `claims`，省略则不写该字段 |
+
+输出文件（均可直接交给 `gate`）：
+
+- `gate.sbom.json`：文件级 SBOM（`schemaVersion` `"1.0"`，清单与扫描语义同 `generate`）
+  外加 `components`。
+- `gate.attestation.json`：自包含签名证明（`attestationVersion` `"1.0"`）。`subject` 以
+  `artifactDigest` 绑定产物清单、`sbomDigest` 绑定 SBOM 规范字节；`publicKey` 由私钥导出；
+  `signature` 覆盖去掉 `signature`/`publicKey` 后载荷的规范字节（与 `gate` 验签约定一致）。
+
+确定性与原子性：证明不含时间戳或随机值，两个输出均为稳定 JSON 加末尾换行，同一组输入重复
+生成逐字节一致；校验、扫描与签名全部成功后才原子替换同名输出，任一失败不改写既有文件。
+
+错误：缺参、未知参数、空值、`--components`/`--claims` 结构错误（非数组/非对象、`name` 或
+`license` 为空、`version` 非字符串、组件重复）均为 `USAGE_ERROR`（退出 1，stdout 无结果）；
+输入路径问题按既有规则为 `INPUT_NOT_FOUND` / `PERMISSION_DENIED`，私钥无法解析或非
+Ed25519 为 `KEY_NOT_FOUND`，危险符号链接为 `SYMLINK_INVALID`。生成结果交给 `gate` 后，
+策略拒绝仍为 `denied`（退出 4），签名、产物或 SBOM 不一致仍为 `VerificationError`（退出 3）。
+
+成功时 stdout 示例：
+
+```json
+{
+  "status": "ATTESTED",
+  "attestationPath": "<绝对路径>/gate.attestation.json",
+  "sbomPath": "<绝对路径>/gate.sbom.json",
+  "artifactDigest": "<64 位十六进制>",
+  "sbomDigest": "<64 位十六进制>",
+  "signerKeyFingerprint": "<64 位十六进制>"
+}
+```
+
 ## 错误码
 
 任何失败都以**非零退出码**结束，并在 stderr 输出机器可读 JSON：
@@ -474,7 +533,7 @@ stderr 的错误 JSON 与既有命令同形：
 | `POLICY_INVALID` | 策略文件 JSON 不可解析或顶层非对象、含未知字段、字段类型/取值非法、`policyVersion` 缺失或不为 `"1.0"`/`"1.1"`、指纹白名单为空数组、`proofNotBefore` 晚于 `proofNotAfter`、1.0 携带 `requiredFiles`/`forbiddenFiles`、1.1 文件级字段为空对象/空数组或类型非法、路径为空/绝对/含反斜杠/空路径段/点目录段、摘要不是 64 位小写十六进制、`forbiddenFiles` 重复或与 `requiredFiles` 重叠（验证与 `policy-sign` 相同） |
 | `POLICY_VIOLATION` | 签名与完整性（及可选 SBOM、共签、策略签名）均通过但不满足策略；`details.violations` 按时间、密钥、SBOM、文件数、大小、文件级规则（必需缺失 → 必需摘要不符 → 禁止出现，同类按路径 UTF-16 码元升序）列出全部违规，每项含 `rule` 与 `observed` |
 | `SYMLINK_INVALID` | 目录扫描发现危险符号链接：形成回路（`details.reason` 为 `cycle`）或目标越出产物根目录（`details.reason` 为 `outside-root`）；`details.path` 为链接的相对路径。generate 在写出任何证明前失败，verify 在签名有效后的扫描阶段失败 |
-| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量，`--bundle` 与独立文件参数（`--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures`）混用，包模式下 `--cosigner-key` 与 `--min-cosigners` 未同时提供，`policy-sign` 缺少 `--policy`/`--key`/`--signature`，或 `--policy-signature` 与 `--policy-key` 缺值、只给一者、未与 `--policy` 同时提供 |
+| `USAGE_ERROR` | 缺少必填参数、未知子命令，`--sbom` 与 `--sbom-signature` 只给一者，`--co-key` 重复或与主密钥相同，共签校验三参数（`--cosignatures` / `--cosigner-key` / `--min-cosigners`）未同时提供、`--min-cosigners` 非正整数或超过共签公钥数量，`--bundle` 与独立文件参数（`--proof` / `--signature` / `--sbom` / `--sbom-signature` / `--cosignatures`）混用，包模式下 `--cosigner-key` 与 `--min-cosigners` 未同时提供，`policy-sign` 缺少 `--policy`/`--key`/`--signature`，或 `--policy-signature` 与 `--policy-key` 缺值、只给一者、未与 `--policy` 同时提供；`attest` 缺参、未知参数、参数值为空，或 `--components`/`--claims` 结构非法（非 JSON 数组/对象、`name`/`license` 为空、`version` 非字符串、组件重复） |
 
 错误不会被伪装成成功：只有在签名有效且全部清单条目逐项一致时才输出 `VERIFIED`。
 
@@ -506,6 +565,16 @@ node provguard.mjs gate     --artifact dist/ \
   --attestation release.attestation.json \
   --sbom release.sbom.json \
   --policy release.policy.json
+# 或直接生成 gate 证明与物料清单（gate.attestation.json / gate.sbom.json）：
+node provguard.mjs attest   --artifact dist/ \
+  --key keys/provguard.private.pem \
+  --components '[{"name":"left-pad","version":"1.3.0","license":"MIT"}]' \
+  --source-repository https://git.example.com/team/app \
+  --source-reference refs/tags/v1.2.3 \
+  --signer-issuer https://oidc.example.com \
+  --signer-subject ci-bot@example.com \
+  --out release/ \
+  --claims '{"buildId":"42"}'
 ```
 
 ## 测试
