@@ -28,9 +28,11 @@
 - 目录扫描的符号链接安全处理：指向产物根目录内部文件/目录的链接按链接路径记录目标内容；
   形成回路或越出产物根目录的链接以 `SYMLINK_INVALID` 失败，不会继续递归或读取外部内容；
 - 独立发布门禁（`gate`）：仅读取本地产物、自包含签名证明、含包名与许可证的软件物料清单及
-  发布策略四类公开文件（不读取密钥或凭证，验签公钥内嵌于证明），验证签名与三方摘要对应关系后
-  逐项比对策略，在 stdout 输出确定性 JSON 报告（`allowed` 退出 0 / `denied` 退出 4），
-  `InputError`/`PolicyError` 退出 2、`VerificationError` 退出 3；
+  发布策略四类公开文件（不读取密钥或凭证，验签公钥内嵌于证明），另可用可重复的
+  `--trusted-key` 把允许接受的证明签名公钥固定为调用方给定的本地 Ed25519 公钥集合；
+  验证签名与三方摘要对应关系后逐项比对策略，在 stdout 输出确定性 JSON 报告
+  （`allowed` 退出 0 / `denied` 退出 4），`InputError`/`PolicyError` 退出 2、
+  `VerificationError` 退出 3；
 - 机器可读的错误码与非零退出码。
 
 ## 约定
@@ -318,12 +320,13 @@ node provguard.mjs gate \
   --artifact <产物路径> \
   --attestation <gate.attestation.json> \
   --sbom <gate.sbom.json> \
-  --policy <gate.policy.json>
+  --policy <gate.policy.json> \
+  [--trusted-key <公钥.pem> ...]
 ```
 
 `gate` 是与既有 `generate`/`verify` 相互独立的发布门禁：**不改动**任何已有命令的默认行为、
 文件格式、标准输出、退出码与异常处理；门禁本身也**不读取任何私钥或凭证**（验签公钥内嵌于
-证明），只读取四个本地公开文件，成功时只向 stdout 写报告，不额外落盘。
+证明），只读取本地公开文件，成功时只向 stdout 写报告，不额外落盘。
 
 四个参数均为必填，缺任一以 `InputError` 结束（退出码 2）：
 
@@ -333,9 +336,21 @@ node provguard.mjs gate \
 | `--attestation` | 自包含签名证明（gate attestation），内嵌公开验签公钥 |
 | `--sbom` | 发布物料清单：文件级 SBOM 外加 `components`（包名与许可证） |
 | `--policy` | 发布策略：非空 `conditions` 数组，仅允许受支持的条件类型 |
+| `--trusted-key` | 可选、可重复：本地 Ed25519 公钥 PEM 文件，把允许接受的证明签名公钥固定为给定集合 |
 
-处理顺序：读取并解析四类输入 → 用证明内嵌公钥验证证明签名 → 重扫产物并核对证明记录的产物摘要
-→ 校验 SBOM 摘要并把 SBOM 清单与当前产物逐项对账 → 逐项评估策略条件 → 输出确定性 JSON 报告。
+处理顺序：读取并解析四类输入 → 解析证明内嵌公钥 →（提供 `--trusted-key` 时）读取各
+trusted-key 公钥并要求内嵌公钥指纹至少命中其一 → 用内嵌公钥验证证明签名 → 重扫产物并核对
+证明记录的产物摘要 → 校验 SBOM 摘要并把 SBOM 清单与当前产物逐项对账 → 逐项评估策略条件 →
+输出确定性 JSON 报告。
+
+- 不提供 `--trusted-key` 时，门禁行为与既有完全一致（四类输入、处理顺序、报告字段、退出码
+  与不落盘行为均不变）。
+- 提供 `--trusted-key` 时，每个值都必须是一个本地 Ed25519 公钥 PEM 文件；可以重复给出，
+  重复指向同一公钥不是错误，任意一个公钥指纹与证明内嵌公钥指纹（SPKI DER 的 SHA-256）
+  匹配即通过信任固定。值为空、路径不存在/不可读、不是合法 PEM 或不是 Ed25519 公钥均为
+  `InputError`（退出码 2）；全部可解析但没有指纹命中证明内嵌公钥为 `VerificationError`
+  （退出码 3）。命中后报告中 `attestation.signer.keyFingerprint` 仍为证明内嵌公钥的
+  SHA-256 指纹，与命中的 trusted-key 指纹一致。
 
 #### 证明文件（`--attestation`）
 
@@ -439,8 +454,8 @@ UTF-8 JSON 对象，`policyVersion` 为 `"1.0"`，仅允许 `policyVersion` 与 
 | --- | --- | --- |
 | 0 | 全部条件通过，`status: "allowed"` | stdout 报告 |
 | 4 | 证明有效但违反来源/身份/摘要/包名/许可证约束，`status: "denied"` | stdout 报告 |
-| 2 | `InputError`（路径不存在/不可读、JSON 语法错误、缺少必需字段）或 `PolicyError`（空策略、未知条件类型、取值不符） | stderr 错误 JSON |
-| 3 | `VerificationError`（内嵌公钥非法、签名无效、证明产物摘要与实际产物不一致、证明或 SBOM 无法与产物建立对应关系） | stderr 错误 JSON |
+| 2 | `InputError`（路径不存在/不可读、JSON 语法错误、缺少必需字段、trusted-key 值为空或文件不存在/不可读/非合法 PEM/非 Ed25519 公钥）或 `PolicyError`（空策略、未知条件类型、取值不符） | stderr 错误 JSON |
+| 3 | `VerificationError`（内嵌公钥非法、内嵌公钥指纹未命中任何 trusted-key、签名无效、证明产物摘要与实际产物不一致、证明或 SBOM 无法与产物建立对应关系） | stderr 错误 JSON |
 
 stderr 的错误 JSON 与既有命令同形：
 
